@@ -186,7 +186,7 @@ def gcfg(gid) -> dict:
     """Saved setup for one server: authorized flag, channel ids, category ids, leaderboard message ids."""
     g = store.d["guilds"].setdefault(str(gid), {})
     g.setdefault("authorized", False)
-    for key in ("ch", "cat", "lb_msg", "lb_period", "readme"):
+    for key in ("ch", "cat", "lb_msg", "lb_period"):
         g.setdefault(key, {})
     return g
 
@@ -1678,7 +1678,7 @@ class Rivalz(commands.Bot):
     async def setup_hook(self):
         self.session = aiohttp.ClientSession()
         self.roblox = RobloxClient(self.session)
-        self.add_dynamic_items(ChallengeButton, TicketButton, ReopenButton, OpenGankButton, LbButton, LbSelect)
+        self.add_dynamic_items(ChallengeButton, TicketButton, ReopenButton, OpenGankButton, LbPage, LbSelect)
         await self.tree.sync()
         expiry_loop.start()
 
@@ -1696,7 +1696,6 @@ class Rivalz(commands.Bot):
         backfill_matches()
         for guild in self.guilds:
             gcfg(guild.id)
-            await ensure_readme(guild)
             if is_authorized(guild.id) and gcfg(guild.id)["ch"].get("panel"):
                 await post_panel(guild)
         store.save()
@@ -1705,7 +1704,6 @@ class Rivalz(commands.Bot):
     async def on_guild_join(self, guild: discord.Guild):
         gcfg(guild.id)
         store.save()
-        await ensure_readme(guild)
         await tell_owner(f"Rivalz joined **{guild.name}** (`{guild.id}`). Run `/authorize` there, then `/build`.")
 
 
@@ -1811,7 +1809,7 @@ def lb_font(weight: str, size: int):
 
 
 LB_W = 1000
-LB_TOP = 15  # the board shows the top 15 fighters
+LB_PAGE = 10  # fighters per page (page 1 = podium + ranks 4 to 10)
 LB_PERIODS = {"day": "Daily", "week": "Weekly", "all": "All-time"}
 C_CARD, C_CARD_LINE = (17, 38, 46), (31, 100, 112)
 C_PANEL, C_ROW, C_ROW_LINE = (18, 53, 64), (22, 38, 46), (42, 68, 82)
@@ -1873,25 +1871,25 @@ def _medal(draw, cx, cy, colour, r=24):
 def render_podium(mode_name, period_label, podium, avatars):
     """Title + the top 3 with their profile pictures. podium: list of dicts (rank, uid, name, w, l)."""
     from PIL import Image, ImageDraw, ImageFilter
-    H = 720
+    H = 500
     im = Image.new("RGBA", (LB_W, H), (0, 0, 0, 0))
     d = ImageDraw.Draw(im, "RGBA")
-    d.rounded_rectangle((20, 10, LB_W - 20, H - 10), radius=34, fill=C_CARD + (255,), outline=C_CARD_LINE, width=3)
-    d.text((LB_W / 2, 66), "Leaderboard", font=lb_font("bold", 42), fill=C_TEXT, anchor="mm")
-    d.text((LB_W / 2, 112), f"{mode_name}  |  {period_label}", font=lb_font("medium", 22), fill=C_CYAN, anchor="mm")
-    top, bottom = 150, 680
-    d.rounded_rectangle((42, top, LB_W - 42, bottom), radius=30, fill=C_PANEL, outline=(34, 150, 170), width=2)
-    slots = {1: (500, 350, 220, C_GOLD), 2: (240, 345, 156, C_SILVER), 3: (760, 345, 156, C_BRONZE)}
+    d.rounded_rectangle((20, 8, LB_W - 20, H - 8), radius=30, fill=C_CARD + (255,), outline=C_CARD_LINE, width=3)
+    d.text((LB_W / 2, 48), "Leaderboard", font=lb_font("bold", 34), fill=C_TEXT, anchor="mm")
+    d.text((LB_W / 2, 82), f"{mode_name}  |  {period_label}", font=lb_font("medium", 19), fill=C_CYAN, anchor="mm")
+    top, bottom = 108, H - 28
+    d.rounded_rectangle((42, top, LB_W - 42, bottom), radius=26, fill=C_PANEL, outline=(34, 150, 170), width=2)
+    slots = {1: (500, 285, 150, C_GOLD), 2: (240, 300, 108, C_SILVER), 3: (760, 300, 108, C_BRONZE)}
     by_rank = {e["rank"]: e for e in podium}
     for rank, (cx, cy, size, colour) in slots.items():
         e = by_rank.get(rank)
         y0 = cy - size // 2
         glow = Image.new("RGBA", (size + 80, size + 80), (0, 0, 0, 0))
-        ImageDraw.Draw(glow).rounded_rectangle((40, 40, size + 40, size + 40), radius=36, fill=colour + (70,))
-        glow = glow.filter(ImageFilter.GaussianBlur(14))
+        ImageDraw.Draw(glow).rounded_rectangle((40, 40, size + 40, size + 40), radius=30, fill=colour + (70,))
+        glow = glow.filter(ImageFilter.GaussianBlur(12))
         im.alpha_composite(glow, (cx - size // 2 - 40, y0 - 40))
         d = ImageDraw.Draw(im, "RGBA")
-        border = 6 if rank == 1 else 4
+        border = 5 if rank == 1 else 4
         d.rounded_rectangle((cx - size // 2 - border, y0 - border, cx + size // 2 + border, y0 + size + border),
                             radius=int(size * 0.2) + border, fill=colour if e else (60, 80, 90))
         av = _rounded_avatar(avatars.get(e["uid"]) if e else None, size, int(size * 0.2), (e or {}).get("name", "?"),
@@ -1899,42 +1897,42 @@ def render_podium(mode_name, period_label, podium, avatars):
         im.alpha_composite(av, (cx - size // 2, y0))
         d = ImageDraw.Draw(im, "RGBA")
         if rank == 1:
-            _crown(d, cx, y0 - 6)
+            _crown(d, cx, y0 - 4, w=96, h=48)
         else:
-            _medal(d, cx, y0 - 28, colour)
-        ny = y0 + size + 26
+            _medal(d, cx, y0 - 22, colour, r=18)
+        ny = y0 + size + 22
         if e:
-            f, txt = _fit_text(d, f"@{e['name']}", "medium", 26 if rank == 1 else 22, 230)
+            f, txt = _fit_text(d, f"@{e['name']}", "medium", 22 if rank == 1 else 19, 230)
             d.text((cx, ny), txt, font=f, fill=colour, anchor="mm")
-            d.text((cx, ny + 36), f"{e['w']} Wins", font=lb_font("bold", 30 if rank == 1 else 26), fill=colour, anchor="mm")
-            d.text((cx, ny + 70), f"W {e['w']}   L {e['l']}", font=lb_font("regular", 18), fill=C_MUTED, anchor="mm")
+            d.text((cx, ny + 28), f"{e['w']} Wins", font=lb_font("bold", 26 if rank == 1 else 22), fill=colour, anchor="mm")
+            d.text((cx, ny + 52), f"W {e['w']}   L {e['l']}", font=lb_font("regular", 15), fill=C_MUTED, anchor="mm")
         else:
-            d.text((cx, ny + 10), "No one yet", font=lb_font("medium", 20), fill=C_MUTED, anchor="mm")
-    d.text((LB_W / 2, bottom - 26), f"Ranked by wins  |  {mode_name}", font=lb_font("regular", 18), fill=C_MUTED, anchor="mm")
+            d.text((cx, ny + 8), "No one yet", font=lb_font("medium", 17), fill=C_MUTED, anchor="mm")
+    d.text((LB_W / 2, bottom - 16), f"Ranked by wins  |  {mode_name}", font=lb_font("regular", 15), fill=C_MUTED, anchor="mm")
     out = io.BytesIO()
     im.save(out, "PNG")
     return out.getvalue()
 
 
 def render_list(entries, avatars):
-    """Rows for ranks 4 to 15, drawn like the leaderboard mock-up."""
+    """Compact rows (same look as before, just smaller). entries: dicts (rank, uid, name, w, l)."""
     from PIL import Image, ImageDraw
-    row_h, gap = 92, 14
-    H = 40 + len(entries) * (row_h + gap) + 26
+    row_h, gap = 62, 8
+    H = 24 + len(entries) * (row_h + gap) + 14
     im = Image.new("RGBA", (LB_W, H), (0, 0, 0, 0))
     d = ImageDraw.Draw(im, "RGBA")
-    d.rounded_rectangle((20, 0, LB_W - 20, H - 4), radius=34, fill=C_CARD + (255,), outline=C_CARD_LINE, width=3)
-    y = 34
+    d.rounded_rectangle((20, 0, LB_W - 20, H - 4), radius=30, fill=C_CARD + (255,), outline=C_CARD_LINE, width=3)
+    y = 22
     for e in entries:
-        d.rounded_rectangle((50, y, LB_W - 50, y + row_h), radius=24, fill=C_ROW, outline=C_ROW_LINE, width=2)
-        d.text((100, y + row_h / 2), str(e["rank"]), font=lb_font("bold", 30), fill=C_TEXT, anchor="mm")
-        av = _rounded_avatar(avatars.get(e["uid"]), 64, 14, e.get("name", "?"))
-        im.alpha_composite(av, (146, y + 14))
+        d.rounded_rectangle((50, y, LB_W - 50, y + row_h), radius=20, fill=C_ROW, outline=C_ROW_LINE, width=2)
+        d.text((100, y + row_h / 2), str(e["rank"]), font=lb_font("bold", 24), fill=C_TEXT, anchor="mm")
+        av = _rounded_avatar(avatars.get(e["uid"]), 44, 11, e.get("name", "?"))
+        im.alpha_composite(av, (140, y + 9))
         d = ImageDraw.Draw(im, "RGBA")
-        f, txt = _fit_text(d, f"@{e['name']}", "medium", 26, 520)
-        d.text((230, y + 31), txt, font=f, fill=C_TEXT, anchor="lm")
-        d.text((230, y + 63), f"W {e['w']}  L {e['l']}", font=lb_font("regular", 19), fill=C_MUTED, anchor="lm")
-        d.text((LB_W - 90, y + row_h / 2), f"{e['w']} Wins", font=lb_font("bold", 28), fill=C_CYAN, anchor="rm")
+        f, txt = _fit_text(d, f"@{e['name']}", "medium", 21, 540)
+        d.text((204, y + 22), txt, font=f, fill=C_TEXT, anchor="lm")
+        d.text((204, y + 46), f"W {e['w']}  L {e['l']}", font=lb_font("regular", 15), fill=C_MUTED, anchor="lm")
+        d.text((LB_W - 90, y + row_h / 2), f"{e['w']} Wins", font=lb_font("bold", 22), fill=C_CYAN, anchor="rm")
         y += row_h + gap
     out = io.BytesIO()
     im.save(out, "PNG")
@@ -1943,7 +1941,8 @@ def render_list(entries, avatars):
 
 # ============================================================ leaderboard storage (its own file, with a backup copy)
 class LbStore:
-    """Every decided match lives here, apart from the ticket data, so ticket clean-ups can never touch it."""
+    """Every decided match lives here, apart from the ticket data, so ticket clean-ups can never touch it.
+    Saved atomically (temp file + fsync), with a .bak copy and one snapshot per day (last 14 kept)."""
     def __init__(self, path: str):
         self.path = path
         self.d = {"version": 1, "matches": [], "backfilled": False}
@@ -1952,8 +1951,9 @@ class LbStore:
                 try:
                     with open(p, "r", encoding="utf-8") as fh:
                         loaded = json.load(fh)
-                    self.d.update(loaded)
-                    break
+                    if isinstance(loaded, dict) and isinstance(loaded.get("matches"), list):
+                        self.d.update(loaded)
+                        break
                 except Exception as exc:
                     print(f"Could not read {p}: {exc}")
         self.d.setdefault("matches", [])
@@ -1962,12 +1962,27 @@ class LbStore:
         tmp = self.path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(self.d, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
         if os.path.exists(self.path):
             try:
                 shutil.copyfile(self.path, self.path + ".bak")
             except OSError:
                 pass
         os.replace(tmp, self.path)
+        self._snapshot()
+
+    def _snapshot(self):
+        try:
+            folder = os.path.join(os.path.dirname(self.path), "lb_snapshots")
+            os.makedirs(folder, exist_ok=True)
+            snap = os.path.join(folder, datetime.now(timezone.utc).strftime("leaderboard_%Y-%m-%d.json"))
+            if not os.path.exists(snap):
+                shutil.copyfile(self.path, snap)
+                for old in sorted(os.listdir(folder))[:-14]:
+                    os.remove(os.path.join(folder, old))
+        except OSError:
+            pass
 
 
 lbstore = LbStore(os.path.join(DATA_DIR, "leaderboard_data.json"))
@@ -2038,11 +2053,12 @@ def backfill_matches():
     lbstore.save()
 
 
-def standings(gid, mode, period):
+def standings(mode, period):
+    """GLOBAL standings: every server's decided matches count, so every server shows the same board."""
     since = period_start(period)
     tally = {}
     for x in lbstore.d["matches"]:
-        if x["g"] != gid or x["m"] != mode or x["ts"] < since:
+        if x["m"] != mode or x["ts"] < since:
             continue
         tally.setdefault(x["w"], [0, 0])[0] += 1
         tally.setdefault(x["l"], [0, 0])[1] += 1
@@ -2081,10 +2097,26 @@ async def lookup_user(uid):
     return name, data
 
 
-async def board_message(guild, mode, period):
-    """Builds the whole leaderboard message: the layout plus its two pictures."""
-    rows = standings(guild.id, mode, period)[:LB_TOP]
-    ids = [r[0] for r in rows]
+def page_slice(rows, page):
+    """(page, pages, podium_rows, list_rows) with global ranks attached. Page 1 = ranks 1-10 (podium + 4-10),
+    page 2+ = the next 10 ranks as a list."""
+    pages = max(1, -(-len(rows) // LB_PAGE))
+    page = min(max(1, page), pages)
+    if page == 1:
+        podium = [(i + 1, r) for i, r in enumerate(rows[:3])]
+        listed = [(i + 4, r) for i, r in enumerate(rows[3:LB_PAGE])]
+    else:
+        start = (page - 1) * LB_PAGE
+        podium = []
+        listed = [(start + i + 1, r) for i, r in enumerate(rows[start:start + LB_PAGE])]
+    return page, pages, podium, listed
+
+
+async def board_message(guild, mode, period, page=1):
+    """Builds the whole leaderboard message: the layout plus its pictures. The board is global (all servers)."""
+    rows = standings(mode, period)
+    page, pages, podium_rows, list_rows = page_slice(rows, page)
+    ids = [r[0] for _, r in podium_rows + list_rows]
     found = await asyncio.gather(*(lookup_user(u) for u in ids))
     names = {u: f[0] for u, f in zip(ids, found)}
     avatars = {u: f[1] for u, f in zip(ids, found) if f[1]}
@@ -2092,31 +2124,35 @@ async def board_message(guild, mode, period):
     def entry(rank, r):
         return {"rank": rank, "uid": r[0], "name": names.get(r[0], "unknown"), "w": r[1], "l": r[2]}
 
-    podium = [entry(i + 1, r) for i, r in enumerate(rows[:3])]
-    entries = [entry(i + 4, r) for i, r in enumerate(rows[3:])]
-    files = [discord.File(io.BytesIO(await asyncio.to_thread(
-        render_podium, MODES[mode]["name"], LB_PERIODS[period], podium, avatars)), filename="podium.png")]
+    files = []
+    if page == 1:
+        podium = [entry(rk, r) for rk, r in podium_rows]
+        files.append(discord.File(io.BytesIO(await asyncio.to_thread(
+            render_podium, MODES[mode]["name"], LB_PERIODS[period], podium, avatars)), filename="podium.png"))
+    entries = [entry(rk, r) for rk, r in list_rows]
     if entries:
-        files.append(discord.File(io.BytesIO(await asyncio.to_thread(render_list, entries, avatars)), filename="top15.png"))
-    return lb_layout(guild, mode, period, bool(entries)), files
+        files.append(discord.File(io.BytesIO(await asyncio.to_thread(render_list, entries, avatars)), filename="list.png"))
+    return lb_layout(guild, mode, period, page == 1, bool(entries), page, pages), files
 
 
-# ============================================================ leaderboard message: dropdown, My Rank, top 15
-class LbSelect(discord.ui.DynamicItem[discord.ui.Select], template=r"rv:lbsel:(?P<mode>duel|spar)"):
-    """The dropdown at the top (Daily / Weekly / All-time)."""
-    def __init__(self, mode, period="day"):
+# ============================================================ leaderboard message: dropdown (with My Rank), pages
+class LbSelect(discord.ui.DynamicItem[discord.ui.Select], template=r"rv:lbsel:(?P<mode>duel|spar)(?::(?P<page>\d+))?"):
+    """The dropdown at the top: Daily / Weekly / All-time / My Rank."""
+    def __init__(self, mode, period="day", page=1):
         super().__init__(discord.ui.Select(
-            custom_id=f"rv:lbsel:{mode}", placeholder="Server Total Leaderboard",
+            custom_id=f"rv:lbsel:{mode}:{page}", placeholder="Global Leaderboard",
             options=[
                 discord.SelectOption(label="Daily Leaderboard", value="day", description="Wins since midnight (UTC).", default=period == "day"),
                 discord.SelectOption(label="Weekly Leaderboard", value="week", description="Wins since Monday (UTC).", default=period == "week"),
                 discord.SelectOption(label="All-time Leaderboard", value="all", description="Every win ever recorded.", default=period == "all"),
+                discord.SelectOption(label="My Rank", value="me", description="See your own rank (only you can see it)."),
             ]))
         self.mode = mode
+        self.page = page
 
     @classmethod
     async def from_custom_id(cls, interaction, item, match, /):
-        return cls(match["mode"])
+        return cls(match["mode"], page=int(match["page"] or 1))
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         await safe_reply(interaction, "Something went wrong. Please try again.")
@@ -2126,76 +2162,96 @@ class LbSelect(discord.ui.DynamicItem[discord.ui.Select], template=r"rv:lbsel:(?
         if not interaction.guild or not await guard(interaction):
             return
         values = (interaction.data or {}).get("values") or []
-        period = values[0] if values and values[0] in LB_PERIODS else "day"
-        gcfg(interaction.guild.id)["lb_period"][self.mode] = period
-        store.save()
+        choice = values[0] if values else "day"
+        cfg = gcfg(interaction.guild.id)
         await interaction.response.defer()
+        if choice == "me":  # keep the board as it is (the dropdown snaps back), answer privately
+            period = cfg["lb_period"].get(self.mode, "day")
+            view, files = await board_message(interaction.guild, self.mode, period, self.page)
+            await interaction.edit_original_response(view=view, attachments=files)
+            await send_my_rank(interaction, self.mode, period)
+            return
+        period = choice if choice in LB_PERIODS else "day"
+        cfg["lb_period"][self.mode] = period
+        store.save()
         view, files = await board_message(interaction.guild, self.mode, period)
         await interaction.edit_original_response(view=view, attachments=files)
 
 
-class LbButton(discord.ui.DynamicItem[discord.ui.Button], template=r"rv:lbme:(?P<mode>duel|spar)"):
-    """My Rank."""
-    def __init__(self, mode):
-        super().__init__(discord.ui.Button(label="My Rank", style=discord.ButtonStyle.secondary,
-                                           emoji="🧑", custom_id=f"rv:lbme:{mode}"))
+class LbPage(discord.ui.DynamicItem[discord.ui.Button], template=r"rv:lbpg:(?P<mode>duel|spar):(?P<page>\d+):(?P<slot>[a-z0-9]+)"):
+    """Page buttons under the board: < 1 2 3 >"""
+    def __init__(self, mode, target, slot, label=None, current=False, disabled=False):
+        super().__init__(discord.ui.Button(
+            label=label or "\u200b", style=discord.ButtonStyle.primary if current else discord.ButtonStyle.secondary,
+            custom_id=f"rv:lbpg:{mode}:{target}:{slot}", disabled=disabled))
         self.mode = mode
+        self.target = target
 
     @classmethod
     async def from_custom_id(cls, interaction, item, match, /):
-        return cls(match["mode"])
+        return cls(match["mode"], int(match["page"]), match["slot"])
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         await safe_reply(interaction, "Something went wrong. Please try again.")
-        print(f"LbButton error: {error!r}")
+        print(f"LbPage error: {error!r}")
 
     async def callback(self, interaction: discord.Interaction):
         if not interaction.guild or not await guard(interaction):
             return
-        await send_my_rank(interaction, self.mode)
+        await interaction.response.defer()
+        period = gcfg(interaction.guild.id)["lb_period"].get(self.mode, "day")
+        view, files = await board_message(interaction.guild, self.mode, period, self.target)
+        await interaction.edit_original_response(view=view, attachments=files)
 
 
-def lb_layout(guild, mode, period, has_list):
+def page_row(mode, page, pages):
+    """The page buttons (Discord allows 5 per row): previous, up to 3 page numbers, next."""
+    first = min(max(1, page - 1), max(1, pages - 2))
+    row = discord.ui.ActionRow()
+    row.add_item(LbPage(mode, max(1, page - 1), "prev", "<", disabled=page <= 1))
+    for i, n in enumerate(range(first, min(pages, first + 2) + 1)):
+        row.add_item(LbPage(mode, n, f"p{i}", str(n), current=n == page))
+    row.add_item(LbPage(mode, min(pages, page + 1), "next", ">", disabled=page >= pages))
+    return row
+
+
+def lb_layout(guild, mode, period, has_podium, has_list, page=1, pages=1):
     m = MODES[mode]
     view = discord.ui.LayoutView(timeout=None)
     c = discord.ui.Container(accent_colour=m["colour"])
     row = discord.ui.ActionRow()
-    row.add_item(LbSelect(mode, period))
+    row.add_item(LbSelect(mode, period, page))
     c.add_item(row)
+    where = f"Top {LB_PAGE}" if pages == 1 else f"Page {page}/{pages}"
     c.add_item(discord.ui.TextDisplay(
-        f"Leaderboard for the number of **{m['name']}** wins.\n-# Showing {LB_PERIODS[period]} | Top {LB_TOP}"))
+        f"Leaderboard for the number of **{m['name']}** wins.\n-# Showing {LB_PERIODS[period]} | {where}"))
     c.add_item(discord.ui.TextDisplay(f"**Server:** {md(guild.name)}"))
     c.add_item(discord.ui.Separator())
-    top = discord.ui.MediaGallery()
-    top.add_item(media="attachment://podium.png")
-    c.add_item(top)
-    c.add_item(discord.ui.Separator())
-    head = discord.ui.TextDisplay("## 📊 Your Current Stats")
-    try:
-        c.add_item(discord.ui.Section(head, accessory=LbButton(mode)))
-    except Exception:
-        c.add_item(head)
-        r2 = discord.ui.ActionRow()
-        r2.add_item(LbButton(mode))
-        c.add_item(r2)
-    c.add_item(discord.ui.Separator())
+    if has_podium:
+        top = discord.ui.MediaGallery()
+        top.add_item(media="attachment://podium.png")
+        c.add_item(top)
     if has_list:
+        if has_podium:
+            c.add_item(discord.ui.Separator())
         lst = discord.ui.MediaGallery()
-        lst.add_item(media="attachment://top15.png")
+        lst.add_item(media="attachment://list.png")
         c.add_item(lst)
-    else:
+    elif has_podium:
         c.add_item(discord.ui.TextDisplay("-# Nobody else is ranked yet."))
+    if pages > 1:
+        c.add_item(discord.ui.Separator())
+        c.add_item(page_row(mode, page, pages))
     view.add_item(c)
     return view
 
 
-async def send_my_rank(interaction: discord.Interaction, mode: str):
-    await interaction.response.defer(ephemeral=True)
-    gid, user = interaction.guild.id, interaction.user
+async def send_my_rank(interaction: discord.Interaction, mode: str, period: str):
+    """Private (ephemeral) My Rank card. The interaction is already answered by the dropdown callback."""
+    user = interaction.user
     m = MODES[mode]
-    period = gcfg(gid)["lb_period"].get(mode, "day")
-    info = rank_info(standings(gid, mode, period), user.id)
-    everything = rank_info(standings(gid, mode, "all"), user.id)
+    info = rank_info(standings(mode, period), user.id)
+    everything = rank_info(standings(mode, "all"), user.id)
     if info:
         top = [f"> **User:** `@{esc(user.name)}`",
                f"> **Rank:** #{info[0]} (Top {info[3]:.2f}%)",
@@ -2208,7 +2264,7 @@ async def send_my_rank(interaction: discord.Interaction, mode: str):
     if everything and period != "all":
         sections.append([f"> **All-time:** #{everything[0]} (Top {everything[3]:.2f}%) | {everything[1]}W {everything[2]}L"])
     await interaction.followup.send(view=build_card(
-        f"📊 Your Current Stats ({m['name']} | {LB_PERIODS[period]})", sections, accent=m["colour"]), ephemeral=True)
+        f"My Rank ({m['name']} | {LB_PERIODS[period]})", sections, accent=m["colour"]), ephemeral=True)
 
 
 async def refresh_leaderboards(guild, repost=False):
@@ -2263,19 +2319,20 @@ async def refresh_leaderboards(guild, repost=False):
 LB_TASKS = {}
 
 
-def schedule_lb_refresh(gid):
-    """Refresh a few seconds after a match is recorded (several matches in a row become one refresh)."""
-    old = LB_TASKS.get(gid)
+def schedule_lb_refresh(gid=None):
+    """The board is global, so a new result refreshes the board in EVERY authorized server, a few seconds later
+    (several matches in a row become one refresh)."""
+    old = LB_TASKS.get("all")
     if old and not old.done():
         return
 
     async def later():
         await asyncio.sleep(8)
-        guild = bot.get_guild(gid)
-        if guild and is_authorized(gid):
-            await refresh_leaderboards(guild)
+        for guild in list(bot.guilds):
+            if is_authorized(guild.id):
+                await refresh_leaderboards(guild)
 
-    LB_TASKS[gid] = asyncio.create_task(later())
+    LB_TASKS["all"] = asyncio.create_task(later())
 
 
 @tasks.loop(minutes=5)
@@ -2285,20 +2342,7 @@ async def lb_loop():
             await refresh_leaderboards(guild)  # new wins, new profile pictures and Daily/Weekly roll-overs
 
 
-# ============================================================ read-me channel + /authorize + /build
-README_TEXT = ("Welcome to **Rivalz**. Rivalz coordinates Duel and Spar matchmaking, tracks every score, "
-               "and ranks fighters on the Duel and Spar leaderboards.")
-
-
-def readme_view(gid):
-    ok = is_authorized(gid)
-    sections = [[f"**Status:** {'Authorized' if ok else 'Not Authorized'}"], [README_TEXT]]
-    if not ok:
-        sections.append(["-# The bot owner must run `/authorize` before Rivalz can be used in this server."])
-    elif not gcfg(gid)["ch"].get("panel"):
-        sections.append(["-# The bot owner must run `/build` to create the Rivalz channels."])
-    buttons = [discord.ui.Button(label="Developer Profile", url=DEVELOPER_URL)] if DEVELOPER_URL else None
-    return build_card("Rivalz", sections, accent=GREEN if ok else GREY, buttons=buttons)
+# ============================================================ /authorize + /build
 
 
 async def tell_owner(text):
@@ -2307,48 +2351,6 @@ async def tell_owner(text):
         await owner.send(text)
     except Exception:
         pass
-
-
-async def ensure_readme(guild):
-    """Create the read-me channel (once) and keep its status card up to date."""
-    rd = gcfg(guild.id)["readme"]
-    chan = guild.get_channel(rd["channel"]) if rd.get("channel") else None
-    if chan is None:
-        if not guild.me.guild_permissions.manage_channels:
-            print(f"Cannot create read-me in {guild.name}: missing Manage Channels.")
-            await tell_owner(f"Rivalz joined **{guild.name}** but needs **Manage Channels** to create the read-me channel.")
-            return
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(
-                view_channel=True, read_message_history=True, send_messages=False, add_reactions=False,
-                create_public_threads=False, create_private_threads=False),
-            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True,
-                                                  read_message_history=True, manage_channels=True),
-        }
-        try:
-            chan = await guild.create_text_channel("read-me", overwrites=overwrites, topic="About Rivalz",
-                                                   reason="Rivalz read-me")
-        except discord.HTTPException as exc:
-            print(f"Could not create read-me in {guild.name}: {exc!r}")
-            return
-        rd["channel"], rd["message"] = chan.id, None
-    view = readme_view(guild.id)
-    if rd.get("message"):
-        try:
-            await chan.get_partial_message(rd["message"]).edit(view=view)
-            store.save()
-            return
-        except discord.NotFound:
-            pass
-        except discord.HTTPException as exc:
-            print(f"Could not update read-me in {guild.name}: {exc!r}")
-            return
-    try:
-        msg = await chan.send(view=view)
-        rd["message"] = msg.id
-    except discord.HTTPException as exc:
-        print(f"Could not post read-me in {guild.name}: {exc!r}")
-    store.save()
 
 
 async def build_guild(guild):
@@ -2461,7 +2463,6 @@ async def authorize(interaction: discord.Interaction):
     cfg["authorized"] = True
     cfg["authorized_by"], cfg["authorized_at"] = interaction.user.id, int(time.time())
     store.save()
-    await ensure_readme(interaction.guild)
     built = bool(cfg["ch"].get("panel"))
     lines = ["> Rivalz is now authorized in this server." if not was else "> This server was already authorized."]
     lines.append("> Everything is set up. Use `/build` any time to repair missing channels." if built
@@ -2486,7 +2487,6 @@ async def build(interaction: discord.Interaction):
         print(f"Build failed: {exc!r}")
         return await notice(interaction, "Build Failed",
                             "> Discord refused one of the channels. Check that Rivalz has **Manage Channels** and **Manage Roles**, then run `/build` again.")
-    await ensure_readme(guild)
     await post_panel(guild)
     await refresh_leaderboards(guild, repost=True)
     sections = [["> Rivalz is built and running in this server."]]
