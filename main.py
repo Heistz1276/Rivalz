@@ -1732,7 +1732,7 @@ class Rivalz(commands.Bot):
     async def setup_hook(self):
         self.session = aiohttp.ClientSession()
         self.roblox = RobloxClient(self.session)
-        self.add_dynamic_items(ChallengeButton, TicketButton, ReopenButton, OpenGankButton, LbPage, LbSelect)
+        self.add_dynamic_items(ChallengeButton, TicketButton, ReopenButton, OpenGankButton, LbButton, LbPage, LbSelect)
         await self.tree.sync()
         expiry_loop.start()
 
@@ -1754,6 +1754,17 @@ class Rivalz(commands.Bot):
             gcfg(guild.id)
             if is_authorized(guild.id) and gcfg(guild.id)["ch"].get("panel"):
                 await post_panel(guild)
+        if not lbstore.d["matches"]:  # nothing saved: rebuild from the result cards in each results channel
+            for guild in self.guilds:
+                rid = gcfg(guild.id)["ch"].get("results") or (LEGACY["results"] if guild.get_channel(LEGACY["results"]) else None)
+                rchan = guild.get_channel(rid) if rid else None
+                if not rchan:
+                    continue
+                try:
+                    scanned, added = await rebuild_from_results(guild, rchan)
+                    print(f"Leaderboard rebuilt from #{rchan.name} in {guild.name}: {added} matches ({scanned} result cards read).")
+                except Exception as exc:
+                    print(f"Could not rebuild the leaderboard from {guild.name}: {exc!r}")
         store.save()
         lb_loop.start()  # draws the leaderboards now and then every 5 minutes
 
@@ -2128,6 +2139,69 @@ def backfill_matches():
     lbstore.save()
 
 
+def message_text(components) -> str:
+    """All the text of a Components V2 message (containers, sections, text displays)."""
+    out = []
+
+    def walk(c):
+        content = getattr(c, "content", None)
+        if isinstance(content, str):
+            out.append(content)
+        for ch in getattr(c, "children", None) or []:
+            walk(ch)
+        acc = getattr(c, "accessory", None)
+        if acc is not None:
+            walk(acc)
+
+    for c in components or []:
+        walk(c)
+    return "\n".join(out)
+
+
+def parse_result(text):
+    """A final (closed) result card -> one match row, or None (live cards, draws and 'not recorded' are skipped)."""
+    title = re.search(r"(Duel|Spar) #(\d+) Result", text)
+    if not title or "This match is closed" not in text:
+        return None
+    win = re.search(r"\*\*Winner:\*\* <@!?(\d+)>", text)
+    pl = re.search(r"<@!?(\d+)> vs <@!?(\d+)>", text)
+    if not win or not pl:
+        return None
+    wid, a, b = int(win.group(1)), int(pl.group(1)), int(pl.group(2))
+    if wid not in (a, b):
+        return None
+    when = re.search(r"Ended At\*\* - <t:(\d+):F>", text)
+    sc = re.search(r"`(\d+|-)` - `(\d+|-)`", text)
+    ws = ls = 0
+    if sc and sc.group(1).isdigit() and sc.group(2).isdigit():
+        ws, ls = (int(sc.group(1)), int(sc.group(2))) if wid == a else (int(sc.group(2)), int(sc.group(1)))
+    return {"m": title.group(1).lower(), "n": int(title.group(2)), "ts": int(when.group(1)) if when else 0,
+            "w": wid, "l": b if wid == a else a, "ws": ws, "ls": ls}
+
+
+async def rebuild_from_results(guild, chan, limit=None):
+    """Read the bot's own result cards in a results channel and add every finished match that is missing.
+    Discord keeps those cards, so this works even when the bot's data files were lost."""
+    seen = {(x["g"], x["m"], x["n"]) for x in lbstore.d["matches"]}
+    scanned = added = 0
+    async for message in chan.history(limit=limit, oldest_first=True):
+        if message.author.id != bot.user.id:
+            continue
+        scanned += 1
+        row = parse_result(message_text(message.components) or message.content or "")
+        if not row:
+            continue
+        key = (guild.id, row["m"], row["n"])
+        if key in seen:
+            continue
+        seen.add(key)
+        lbstore.d["matches"].append({"g": guild.id, **row})
+        added += 1
+    if added:
+        lbstore.save()
+    return scanned, added
+
+
 def recover_matches():
     """Prints how many matches the database holds. If it is empty, rebuilds from saved tickets/archive (backfill)."""
     if lbstore.d["matches"]:
@@ -2221,7 +2295,7 @@ async def board_message(guild, mode, period, page=1):
 
 # ============================================================ leaderboard message: dropdown (with My Rank), pages
 class LbSelect(discord.ui.DynamicItem[discord.ui.Select], template=r"rv:lbsel:(?P<mode>duel|spar)(?::(?P<page>\d+))?"):
-    """The dropdown at the top: Daily / Weekly / All-time / My Rank."""
+    """The dropdown at the top: Daily / Weekly / All-time."""
     def __init__(self, mode, period="day", page=1):
         super().__init__(discord.ui.Select(
             custom_id=f"rv:lbsel:{mode}:{page}", placeholder="Global Leaderboard",
@@ -2229,7 +2303,6 @@ class LbSelect(discord.ui.DynamicItem[discord.ui.Select], template=r"rv:lbsel:(?
                 discord.SelectOption(label="Daily Leaderboard", value="day", description="Wins since midnight (UTC).", default=period == "day"),
                 discord.SelectOption(label="Weekly Leaderboard", value="week", description="Wins since Monday (UTC).", default=period == "week"),
                 discord.SelectOption(label="All-time Leaderboard", value="all", description="Every win ever recorded.", default=period == "all"),
-                discord.SelectOption(label="My Rank", value="me", description="See your own rank (only you can see it)."),
             ]))
         self.mode = mode
         self.page = page
@@ -2249,17 +2322,34 @@ class LbSelect(discord.ui.DynamicItem[discord.ui.Select], template=r"rv:lbsel:(?
         choice = values[0] if values else "day"
         cfg = gcfg(interaction.guild.id)
         await interaction.response.defer()
-        if choice == "me":  # keep the board as it is (the dropdown snaps back), answer privately
-            period = cfg["lb_period"].get(self.mode, "day")
-            view, files = await board_message(interaction.guild, self.mode, period, self.page)
-            await interaction.edit_original_response(view=view, attachments=files)
-            await send_my_rank(interaction, self.mode, period)
-            return
         period = choice if choice in LB_PERIODS else "day"
         cfg["lb_period"][self.mode] = period
         store.save()
         view, files = await board_message(interaction.guild, self.mode, period)
         await interaction.edit_original_response(view=view, attachments=files)
+
+
+class LbButton(discord.ui.DynamicItem[discord.ui.Button], template=r"rv:lbme:(?P<mode>duel|spar)"):
+    """Small My Rank button at the top of the board (answers privately, the board is not touched)."""
+    def __init__(self, mode):
+        super().__init__(discord.ui.Button(label="My Rank", style=discord.ButtonStyle.secondary,
+                                           custom_id=f"rv:lbme:{mode}"))
+        self.mode = mode
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        return cls(match["mode"])
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        await safe_reply(interaction, "Something went wrong. Please try again.")
+        print(f"LbButton error: {error!r}")
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.guild or not await guard(interaction):
+            return
+        await interaction.response.defer(ephemeral=True)
+        period = gcfg(interaction.guild.id)["lb_period"].get(self.mode, "day")
+        await send_my_rank(interaction, self.mode, period)
 
 
 class LbPage(discord.ui.DynamicItem[discord.ui.Button], template=r"rv:lbpg:(?P<mode>duel|spar):(?P<page>\d+):(?P<slot>[a-z0-9]+)"):
@@ -2307,8 +2397,15 @@ def lb_layout(guild, mode, period, has_podium, has_list, page=1, pages=1):
     row.add_item(LbSelect(mode, period, page))
     c.add_item(row)
     where = f"Top {LB_PAGE}" if pages == 1 else f"Page {page}/{pages}"
-    c.add_item(discord.ui.TextDisplay(
-        f"Leaderboard for the number of **{m['name']}** wins.\n-# Showing {LB_PERIODS[period]} | {where}"))
+    intro = discord.ui.TextDisplay(
+        f"Leaderboard for the number of **{m['name']}** wins.\n-# Showing {LB_PERIODS[period]} | {where}")
+    try:
+        c.add_item(discord.ui.Section(intro, accessory=LbButton(mode)))  # small My Rank button, top right
+    except Exception:
+        c.add_item(intro)
+        r2 = discord.ui.ActionRow()
+        r2.add_item(LbButton(mode))
+        c.add_item(r2)
     c.add_item(discord.ui.TextDisplay(f"**Server:** {md(guild.name)}"))
     c.add_item(discord.ui.Separator())
     if has_podium:
@@ -2639,6 +2736,33 @@ async def restoreboard(interaction: discord.Interaction, file: discord.Attachmen
     schedule_lb_refresh()
     await notice(interaction, "Leaderboard Restored",
                  [f"> Added **{added}** matches ({len(lbstore.d['matches'])} saved in total).",
+                  "> The boards refresh in a few seconds."], accent=GREEN)
+
+
+@bot.tree.command(name="rebuildboard", description="Owner only: rebuild the leaderboard from the result cards in a results channel.")
+@app_commands.describe(channel="The results channel to read (default: this server's results channel)")
+async def rebuildboard(interaction: discord.Interaction, channel: discord.TextChannel = None):
+    if interaction.user.id != OWNER_ID:
+        return await interaction.response.send_message("Owner only.", ephemeral=True)
+    if not interaction.guild:
+        return await interaction.response.send_message("Use this inside a server.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    chan = channel
+    if chan is None:
+        rid = gcfg(interaction.guild.id)["ch"].get("results") or (LEGACY["results"] if interaction.guild.get_channel(LEGACY["results"]) else None)
+        chan = interaction.guild.get_channel(rid) if rid else None
+    if not chan:
+        return await notice(interaction, "No Results Channel", "> Pick the results channel with the `channel` option.")
+    try:
+        scanned, added = await rebuild_from_results(interaction.guild, chan)
+    except discord.HTTPException as exc:
+        print(f"Rebuild failed: {exc!r}")
+        return await notice(interaction, "Could Not Read The Channel",
+                            "> Rivalz needs **View Channel** and **Read Message History** in that channel.")
+    schedule_lb_refresh()
+    await notice(interaction, "Leaderboard Rebuilt",
+                 [f"> Read **{scanned}** result cards from {chan.mention}.",
+                  f"> Added **{added}** matches ({len(lbstore.d['matches'])} saved in total).",
                   "> The boards refresh in a few seconds."], accent=GREEN)
 
 
