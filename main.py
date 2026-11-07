@@ -832,8 +832,23 @@ async def create_ticket(guild: discord.Guild, ch, number=None):
     name = f"{m['prefix']}-{n:03d}"
     vc_name = f"{m['prefix'].title()} {n:03d}"
 
-    cat_id = gcfg(guild.id)["cat"].get("tickets")
-    category = guild.get_channel(cat_id) if cat_id else None  # None = top of the channel list if /build was not run
+    cfg_g = gcfg(guild.id)
+    cat_id = cfg_g["cat"].get("tickets")
+    category = guild.get_channel(cat_id) if cat_id else None
+    if not isinstance(category, discord.CategoryChannel):  # deleted or never built: make the tickets category again
+        try:
+            staff_r = guild.get_role(STAFF_ROLE_ID) if STAFF_ROLE_ID else None
+            cat_ow = {guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                      guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True,
+                                                            connect=True, speak=True)}
+            if staff_r:
+                cat_ow[staff_r] = discord.PermissionOverwrite(view_channel=True, read_message_history=True)
+            category = await guild.create_category("TICKETS", overwrites=cat_ow, reason="Rivalz: tickets category was missing")
+            cfg_g["cat"]["tickets"] = category.id
+            store.save()
+        except discord.HTTPException as exc:
+            print(f"Could not recreate the tickets category: {exc!r}")
+            category = None
     members = []
     for uid in (ch["requester"], ch["opponent"]):
         members.append(guild.get_member(uid) or await guild.fetch_member(uid))
@@ -2563,6 +2578,13 @@ async def build_guild(guild):
     async def text(key, name, parent, overwrites, topic):
         c = guild.get_channel(chs[key]) if chs.get(key) else None
         if isinstance(c, discord.TextChannel):
+            if parent and c.category_id != parent.id:  # e.g. an old LEADERBOARDS category: pull it into the main one
+                try:
+                    await c.edit(category=parent, sync_permissions=False, reason="Rivalz /build")
+                    created.append(f"{c.mention} (moved into **{parent.name}**)")
+                    return c
+                except discord.HTTPException:
+                    pass
             kept.append(c.mention)
             return c
         c = await guild.create_text_channel(name, category=parent, overwrites=overwrites, topic=topic, reason="Rivalz /build")
@@ -2570,14 +2592,25 @@ async def build_guild(guild):
         created.append(c.mention)
         return c
 
+    # Category 1: the 5 base channels
     main = await category("main", "RIVALZ", {})
     await text("panel", "matchmaking", main, read_only, "Start a Duel or Spar from here.")
     await text("results", "results", main, read_only, "Finished match results.")
     await text("log", "match-logs", main, private, "Rivalz ticket logs (staff only).")
-    boards = await category("lb", "LEADERBOARDS", {})
-    await text("duel_lb", "duel-leaderboard", boards, read_only, "Duel leaderboard, ranked by wins.")
-    await text("spar_lb", "spar-leaderboard", boards, read_only, "Spar leaderboard, ranked by wins.")
+    await text("duel_lb", "duel-leaderboard", main, read_only, "Duel leaderboard, ranked by wins.")
+    await text("spar_lb", "spar-leaderboard", main, read_only, "Spar leaderboard, ranked by wins.")
+    # Category 2: tickets (every Duel/Spar ticket is created in here)
     await category("tickets", "TICKETS", private)
+    # An old LEADERBOARDS category from the previous layout is removed once it is empty
+    old_lb = guild.get_channel(cats["lb"]) if cats.get("lb") else None
+    if isinstance(old_lb, discord.CategoryChannel):
+        if not old_lb.channels:
+            try:
+                await old_lb.delete(reason="Rivalz /build: leaderboards now live in the main category")
+                created.append("Removed the empty old LEADERBOARDS category")
+            except discord.HTTPException:
+                pass
+    cats.pop("lb", None)
     store.save()
     return created, kept
 
@@ -2657,14 +2690,17 @@ async def build(interaction: discord.Interaction):
     if not is_authorized(guild.id):
         return await notice(interaction, "Not Authorized", "> Run `/authorize` in this server first, then `/build`.", accent=GREY)
     await interaction.response.defer(ephemeral=True)
-    if not guild.me.guild_permissions.manage_channels:
-        return await notice(interaction, "Missing Permission", "> Rivalz needs **Manage Channels** to build the channels.")
+    perms = guild.me.guild_permissions
+    if not (perms.manage_channels and perms.manage_roles):
+        return await notice(interaction, "Missing Permission",
+                            "> Rivalz needs **Manage Channels** and **Manage Roles** (it sets the private/read-only channel permissions). Give the bot those, then run `/build` again.")
     try:
         created, kept = await build_guild(guild)
     except discord.HTTPException as exc:
         print(f"Build failed: {exc!r}")
         return await notice(interaction, "Build Failed",
-                            "> Discord refused one of the channels. Check that Rivalz has **Manage Channels** and **Manage Roles**, then run `/build` again.")
+                            f"> Discord refused one of the channels: `{exc.status} / {exc.code}: {exc.text}`\n"
+                            "> Check that Rivalz has **Manage Channels**, **Manage Roles**, **View Channel**, **Send Messages**, **Embed Links** and **Attach Files**, then run `/build` again.")
     await post_panel(guild)
     await refresh_leaderboards(guild, repost=True)
     sections = [["> Rivalz is built and running in this server."]]
