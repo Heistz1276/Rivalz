@@ -1692,7 +1692,9 @@ class Rivalz(commands.Bot):
         if self._ready_once:
             return
         self._ready_once = True
+        print(f"Data folder: {DATA_DIR}")
         migrate_legacy()
+        recover_matches()
         backfill_matches()
         for guild in self.guilds:
             gcfg(guild.id)
@@ -1869,70 +1871,63 @@ def _medal(draw, cx, cy, colour, r=24):
 
 
 def render_podium(mode_name, period_label, podium, avatars):
-    """Title + the top 3 with their profile pictures. podium: list of dicts (rank, uid, name, w, l)."""
+    """Title + the top 3 with their profile pictures (compact). podium: list of dicts (rank, uid, name, w, l)."""
     from PIL import Image, ImageDraw, ImageFilter
-    H = 500
+    H = 330
     im = Image.new("RGBA", (LB_W, H), (0, 0, 0, 0))
     d = ImageDraw.Draw(im, "RGBA")
-    d.rounded_rectangle((20, 8, LB_W - 20, H - 8), radius=30, fill=C_CARD + (255,), outline=C_CARD_LINE, width=3)
-    d.text((LB_W / 2, 48), "Leaderboard", font=lb_font("bold", 34), fill=C_TEXT, anchor="mm")
-    d.text((LB_W / 2, 82), f"{mode_name}  |  {period_label}", font=lb_font("medium", 19), fill=C_CYAN, anchor="mm")
-    top, bottom = 108, H - 28
-    d.rounded_rectangle((42, top, LB_W - 42, bottom), radius=26, fill=C_PANEL, outline=(34, 150, 170), width=2)
-    slots = {1: (500, 285, 150, C_GOLD), 2: (240, 300, 108, C_SILVER), 3: (760, 300, 108, C_BRONZE)}
+    d.rounded_rectangle((20, 6, LB_W - 20, H - 6), radius=26, fill=C_CARD + (255,), outline=C_CARD_LINE, width=3)
+    d.text((LB_W / 2, 36), "Leaderboard", font=lb_font("bold", 32), fill=C_TEXT, anchor="mm")
+    d.text((LB_W / 2, 66), f"{mode_name}  |  {period_label}", font=lb_font("medium", 20), fill=C_CYAN, anchor="mm")
+    top, bottom = 86, H - 18
+    d.rounded_rectangle((42, top, LB_W - 42, bottom), radius=22, fill=C_PANEL, outline=(34, 150, 170), width=2)
+    slots = {1: (500, 188, 92, C_GOLD), 2: (240, 196, 72, C_SILVER), 3: (760, 196, 72, C_BRONZE)}
     by_rank = {e["rank"]: e for e in podium}
     for rank, (cx, cy, size, colour) in slots.items():
         e = by_rank.get(rank)
         y0 = cy - size // 2
-        glow = Image.new("RGBA", (size + 80, size + 80), (0, 0, 0, 0))
-        ImageDraw.Draw(glow).rounded_rectangle((40, 40, size + 40, size + 40), radius=30, fill=colour + (70,))
-        glow = glow.filter(ImageFilter.GaussianBlur(12))
-        im.alpha_composite(glow, (cx - size // 2 - 40, y0 - 40))
-        d = ImageDraw.Draw(im, "RGBA")
-        border = 5 if rank == 1 else 4
-        d.rounded_rectangle((cx - size // 2 - border, y0 - border, cx + size // 2 + border, y0 + size + border),
-                            radius=int(size * 0.2) + border, fill=colour if e else (60, 80, 90))
+        d.rounded_rectangle((cx - size // 2 - 4, y0 - 4, cx + size // 2 + 4, y0 + size + 4),
+                            radius=int(size * 0.2) + 4, fill=colour if e else (60, 80, 90))
         av = _rounded_avatar(avatars.get(e["uid"]) if e else None, size, int(size * 0.2), (e or {}).get("name", "?"),
                              tint={1: (14, 130, 160), 2: (50, 90, 150), 3: (170, 110, 40)}[rank])
         im.alpha_composite(av, (cx - size // 2, y0))
         d = ImageDraw.Draw(im, "RGBA")
         if rank == 1:
-            _crown(d, cx, y0 - 4, w=96, h=48)
+            _crown(d, cx, y0 - 3, w=64, h=32)
         else:
-            _medal(d, cx, y0 - 22, colour, r=18)
-        ny = y0 + size + 22
+            _medal(d, cx, y0 - 14, colour, r=13)
+        ny = y0 + size + 18
         if e:
-            f, txt = _fit_text(d, f"@{e['name']}", "medium", 22 if rank == 1 else 19, 230)
+            f, txt = _fit_text(d, f"@{e['name']}", "medium", 22 if rank == 1 else 20, 230)
             d.text((cx, ny), txt, font=f, fill=colour, anchor="mm")
-            d.text((cx, ny + 28), f"{e['w']} Wins", font=lb_font("bold", 26 if rank == 1 else 22), fill=colour, anchor="mm")
-            d.text((cx, ny + 52), f"W {e['w']}   L {e['l']}", font=lb_font("regular", 15), fill=C_MUTED, anchor="mm")
+            d.text((cx, ny + 26), f"{e['w']} Wins  |  W {e['w']}  L {e['l']}", font=lb_font("bold", 20 if rank == 1 else 18),
+                   fill=colour, anchor="mm")
         else:
-            d.text((cx, ny + 8), "No one yet", font=lb_font("medium", 17), fill=C_MUTED, anchor="mm")
-    d.text((LB_W / 2, bottom - 16), f"Ranked by wins  |  {mode_name}", font=lb_font("regular", 15), fill=C_MUTED, anchor="mm")
+            d.text((cx, ny + 4), "No one yet", font=lb_font("medium", 18), fill=C_MUTED, anchor="mm")
     out = io.BytesIO()
     im.save(out, "PNG")
     return out.getvalue()
 
 
 def render_list(entries, avatars):
-    """Compact rows (same look as before, just smaller). entries: dicts (rank, uid, name, w, l)."""
+    """Compact rows, one line each. entries: dicts (rank, uid, name, w, l)."""
     from PIL import Image, ImageDraw
-    row_h, gap = 62, 8
-    H = 24 + len(entries) * (row_h + gap) + 14
+    row_h, gap = 46, 6
+    H = 16 + len(entries) * (row_h + gap) + 8
     im = Image.new("RGBA", (LB_W, H), (0, 0, 0, 0))
     d = ImageDraw.Draw(im, "RGBA")
-    d.rounded_rectangle((20, 0, LB_W - 20, H - 4), radius=30, fill=C_CARD + (255,), outline=C_CARD_LINE, width=3)
-    y = 22
+    d.rounded_rectangle((20, 0, LB_W - 20, H - 3), radius=26, fill=C_CARD + (255,), outline=C_CARD_LINE, width=3)
+    y = 14
     for e in entries:
-        d.rounded_rectangle((50, y, LB_W - 50, y + row_h), radius=20, fill=C_ROW, outline=C_ROW_LINE, width=2)
-        d.text((100, y + row_h / 2), str(e["rank"]), font=lb_font("bold", 24), fill=C_TEXT, anchor="mm")
-        av = _rounded_avatar(avatars.get(e["uid"]), 44, 11, e.get("name", "?"))
-        im.alpha_composite(av, (140, y + 9))
+        d.rounded_rectangle((44, y, LB_W - 44, y + row_h), radius=16, fill=C_ROW, outline=C_ROW_LINE, width=2)
+        d.text((88, y + row_h / 2), str(e["rank"]), font=lb_font("bold", 22), fill=C_TEXT, anchor="mm")
+        av = _rounded_avatar(avatars.get(e["uid"]), 34, 9, e.get("name", "?"))
+        im.alpha_composite(av, (122, y + 6))
         d = ImageDraw.Draw(im, "RGBA")
-        f, txt = _fit_text(d, f"@{e['name']}", "medium", 21, 540)
-        d.text((204, y + 22), txt, font=f, fill=C_TEXT, anchor="lm")
-        d.text((204, y + 46), f"W {e['w']}  L {e['l']}", font=lb_font("regular", 15), fill=C_MUTED, anchor="lm")
-        d.text((LB_W - 90, y + row_h / 2), f"{e['w']} Wins", font=lb_font("bold", 22), fill=C_CYAN, anchor="rm")
+        f, txt = _fit_text(d, f"@{e['name']}", "medium", 22, 430)
+        d.text((170, y + row_h / 2), txt, font=f, fill=C_TEXT, anchor="lm")
+        d.text((640, y + row_h / 2), f"W {e['w']}  L {e['l']}", font=lb_font("regular", 17), fill=C_MUTED, anchor="lm")
+        d.text((LB_W - 76, y + row_h / 2), f"{e['w']} Wins", font=lb_font("bold", 22), fill=C_CYAN, anchor="rm")
         y += row_h + gap
     out = io.BytesIO()
     im.save(out, "PNG")
@@ -2051,6 +2046,29 @@ def backfill_matches():
             lbstore.d["matches"].append(row)
     lbstore.d["backfilled"] = True
     lbstore.save()
+
+
+def recover_matches():
+    """If the leaderboard file came up empty, try its backup copy, then the daily snapshots, then rebuild
+    from the saved tickets/archive (backfill). Always prints how many matches are loaded and from where."""
+    if lbstore.d["matches"]:
+        print(f"Leaderboard: {len(lbstore.d['matches'])} matches loaded from {lbstore.path}")
+        return
+    folder = os.path.join(os.path.dirname(lbstore.path), "lb_snapshots")
+    snaps = sorted((os.path.join(folder, f) for f in os.listdir(folder)), reverse=True) if os.path.isdir(folder) else []
+    for cand in [lbstore.path + ".bak"] + snaps:
+        try:
+            with open(cand, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data.get("matches"), list) and data["matches"]:
+                lbstore.d["matches"] = data["matches"]
+                lbstore.save()
+                print(f"Leaderboard: restored {len(data['matches'])} matches from {cand}")
+                return
+        except Exception:
+            continue
+    lbstore.d["backfilled"] = False  # nothing to restore: rebuild from tickets/archive below
+    print(f"Leaderboard: no saved matches found in {lbstore.path} (rebuilding from tickets if any).")
 
 
 def standings(mode, period):
@@ -2495,6 +2513,69 @@ async def build(interaction: discord.Interaction):
     if kept:
         sections.append(["**Already there**"] + [f"> {x}" for x in kept])
     await interaction.followup.send(view=build_card("Build Complete", sections, accent=GREEN), ephemeral=True)
+
+
+@bot.tree.command(name="restoreboard", description="Owner only: put leaderboard wins back from an old data file.")
+@app_commands.describe(file="leaderboard_data.json, leaderboard_data.json.bak or rivalz_data.json from your old folder")
+async def restoreboard(interaction: discord.Interaction, file: discord.Attachment):
+    if interaction.user.id != OWNER_ID:
+        return await interaction.response.send_message("Owner only.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    if file.size > 25 * 1024 * 1024:
+        return await notice(interaction, "File Too Big", "> That file is too large.")
+    try:
+        data = json.loads((await file.read()).decode("utf-8"))
+        assert isinstance(data, dict)
+    except Exception:
+        return await notice(interaction, "Not A Data File", "> That is not a valid JSON data file.")
+    rows = [r for r in data.get("matches", []) if isinstance(r, dict)]
+    sources = [(a, a.get("created", 0)) for a in (data.get("archive") or {}).values() if isinstance(a, dict)]
+    sources += [(t, t.get("ended_at") or t.get("created", 0)) for t in (data.get("tickets") or {}).values()
+                if isinstance(t, dict) and t.get("status") in ("ended", "finished")]
+    for src, ts in sources:
+        try:
+            row = match_row(src, ts)
+        except Exception:
+            row = None
+        if row:
+            rows.append(row)
+    seen = {(x["g"], x["m"], x["n"]) for x in lbstore.d["matches"]}
+    added = 0
+    for r in rows:
+        try:
+            key = (r["g"], r["m"], r["n"])
+            if r["m"] not in MODES or key in seen:
+                continue
+            lbstore.d["matches"].append({"g": r["g"], "m": r["m"], "n": r["n"], "ts": int(r["ts"]), "w": int(r["w"]),
+                                         "l": int(r["l"]), "ws": r.get("ws", 0), "ls": r.get("ls", 0)})
+            seen.add(key)
+            added += 1
+        except Exception:
+            continue
+    lbstore.save()
+    schedule_lb_refresh()
+    await notice(interaction, "Leaderboard Restored",
+                 [f"> Added **{added}** matches ({len(lbstore.d['matches'])} saved in total).",
+                  "> The boards refresh in a few seconds."], accent=GREEN)
+
+
+@bot.tree.command(name="addmatch", description="Owner only: add one past result to the global leaderboard.")
+@app_commands.describe(mode="Duel or Spar", winner="Who won", loser="Who lost", days_ago="How many days ago it happened (default 0)")
+@app_commands.choices(mode=[app_commands.Choice(name="Duel", value="duel"), app_commands.Choice(name="Spar", value="spar")])
+async def addmatch(interaction: discord.Interaction, mode: app_commands.Choice[str], winner: discord.User,
+                   loser: discord.User, days_ago: app_commands.Range[int, 0, 3650] = 0):
+    if interaction.user.id != OWNER_ID:
+        return await interaction.response.send_message("Owner only.", ephemeral=True)
+    if winner.id == loser.id:
+        return await notice(interaction, "Invalid", "> The winner and loser must be different people.")
+    await interaction.response.defer(ephemeral=True)
+    lbstore.d["matches"].append({"g": interaction.guild_id or 0, "m": mode.value, "n": -int(time.time() * 1000),
+                                 "ts": int(time.time()) - days_ago * 86400, "w": winner.id, "l": loser.id, "ws": 0, "ls": 0})
+    lbstore.save()
+    schedule_lb_refresh()
+    await notice(interaction, "Match Added",
+                 [f"> **{mode.name}:** {winner.mention} beat {loser.mention}", "> The boards refresh in a few seconds."],
+                 accent=GREEN)
 
 
 @bot.tree.error
