@@ -1,18 +1,20 @@
 """
 Rivalz - Matchmaking bot for Duels and Spars
-Requires: discord.py >= 2.6 (Components V2 + modal selects), aiohttp, python-dotenv
+Requires: discord.py >= 2.6 (Components V2 + modal selects), aiohttp, python-dotenv, Pillow
 Run:      py main.py
 Needs the MESSAGE CONTENT INTENT enabled in the Developer Portal (Bot tab) for the gank image step.
 """
 import asyncio
 import io
 import json
+import math
 import os
 import re
 import subprocess
 import sys
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlparse
 
 
@@ -60,18 +62,20 @@ def env_int(name: str, default: int = 0) -> int:
 TOKEN = os.getenv("DISCORD_TOKEN", "")
 OWNER_ID = env_int("OWNER_ID")
 STAFF_ROLE_ID = env_int("STAFF_ROLE_ID")
-ROBLOX_COOKIE = os.getenv("ROBLOX_COOKIE", "").strip().strip("'\"")  # alt account cookie, used to read live servers
+DEVELOPER_URL = os.getenv("DEVELOPER_URL", "").strip() or (f"https://discord.com/users/{OWNER_ID}" if OWNER_ID else "")
 
-# Channels (main category 1568343167437115423 holds the panel, logs and results channels)
-PANEL_CHANNEL_ID = 1568343031294459904
-LOG_CHANNEL_ID = 1568525004164042842
-RESULTS_CHANNEL_ID = 1568527659334377492
-MAIN_CATEGORY_ID = 1568343167437115423
-TICKET_CATEGORY_ID = 1568527718419664927  # tickets + voice channels are created here
+# Your ORIGINAL server's channels. They are only used once, to move that server onto the new per-server
+# setup (see migrate_legacy). Every other server gets its channels from /build.
+LEGACY = {
+    "panel": 1568343031294459904, "log": 1568525004164042842, "results": 1568527659334377492,
+    "duel_lb": 1568637988164862133, "spar_lb": 1568637960855879680,
+    "cat_main": 1568343167437115423, "cat_tickets": 1568527718419664927,
+}
 
 EXPIRY_MINUTES = env_int("CHALLENGE_EXPIRY_MINUTES", 30)
 MAX_ROUNDS = env_int("MAX_ROUNDS", 25)
 GANK_SECONDS = 120
+LB_MODES = ("duel", "spar")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -121,8 +125,9 @@ class Store:
         self.d.setdefault("counters", {})
         for mode in ("duel", "spar"):
             self.d["counters"].setdefault(mode, 0)
-        for key in ("challenges", "profiles", "tickets", "archive"):
+        for key in ("challenges", "profiles", "tickets", "archive", "guilds"):
             self.d.setdefault(key, {})
+        self.d.setdefault("matches", [])
 
     def save(self):
         tmp = self.path + ".tmp"
@@ -138,27 +143,17 @@ store = Store(DATA_FILE)
 class RobloxClient:
     def __init__(self, session: aiohttp.ClientSession):
         self.s = session
-        self.csrf = ""
 
-    async def _post(self, url, body, *, auth=False):
-        headers = {"Content-Type": "application/json"}
-        if auth and ROBLOX_COOKIE:
-            headers["Cookie"] = f".ROBLOSECURITY={ROBLOX_COOKIE}"
-            headers["x-csrf-token"] = self.csrf
-        for _ in range(2):
-            try:
-                async with self.s.post(url, json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=12)) as r:
-                    if r.status == 403 and auth and "x-csrf-token" in r.headers:
-                        self.csrf = r.headers["x-csrf-token"]
-                        headers["x-csrf-token"] = self.csrf
-                        continue
-                    try:
-                        return r.status, await r.json(content_type=None)
-                    except Exception:
-                        return r.status, None
-            except Exception:
-                return 0, None
-        return 0, None
+    async def _post(self, url, body):
+        try:
+            async with self.s.post(url, json=body, headers={"Content-Type": "application/json"},
+                                   timeout=aiohttp.ClientTimeout(total=12)) as r:
+                try:
+                    return r.status, await r.json(content_type=None)
+                except Exception:
+                    return r.status, None
+        except Exception:
+            return 0, None
 
     async def user_by_name(self, name: str):
         st, data = await self._post(
@@ -184,20 +179,98 @@ class RobloxClient:
         except Exception:
             return {}
 
-    async def live_server(self, user_id: int):
-        """Where a player is right now. status: ok / no_cookie / api / offline / hidden."""
-        if not ROBLOX_COOKIE:
-            return {"status": "no_cookie"}
-        st, data = await self._post("https://presence.roblox.com/v1/presence/users", {"userIds": [user_id]}, auth=True)
+
+# ============================================================ per-server setup + authorization
+def gcfg(gid) -> dict:
+    """Saved setup for one server: authorized flag, channel ids, category ids, leaderboard message ids."""
+    g = store.d["guilds"].setdefault(str(gid), {})
+    g.setdefault("authorized", False)
+    for key in ("ch", "cat", "lb_msg", "readme"):
+        g.setdefault(key, {})
+    return g
+
+
+def is_authorized(gid) -> bool:
+    return bool(gid) and bool(store.d["guilds"].get(str(gid), {}).get("authorized"))
+
+
+def cfg_channel_id(gid, key):
+    return gcfg(gid)["ch"].get(key)
+
+
+# ============================================================ manual server link (set while requesting)
+LINK_HOSTS = {"roblox.com", "www.roblox.com", "web.roblox.com", "roseal.live", "www.roseal.live"}
+JOB_RE = re.compile(r"^[0-9a-fA-F-]{32,40}$")
+CODE_RE = re.compile(r"^[A-Za-z0-9_-]{8,80}$")
+SERVER_HELP = (
+    "> Paste a Roblox server link. These work:\n"
+    "> - a **Roseal** join link (`roseal.live/join?placeId=...&gameInstanceId=...`)\n"
+    "> - a Roblox join link (`roblox.com/games/start?placeId=...&gameInstanceId=...`)\n"
+    "> - a **private server** link (`roblox.com/games/ID/name?privateServerLinkCode=...`)\n"
+    "> - a Roblox **share** link (`roblox.com/share?code=...&type=Server`)")
+
+
+def parse_server_link(raw):
+    """Turn whatever the player pasted into a clean server dict, or None. We only ever keep ids, never the
+    pasted text, and rebuild every URL ourselves, so a link can not send anyone to another website."""
+    raw = (raw or "").strip().strip("<>").strip()
+    if not raw:
+        return None
+    params, path = {}, ""
+    low = raw.lower()
+    if low.startswith("roblox://"):
+        query = raw.split("?", 1)[1] if "?" in raw else raw[len("roblox://"):]
+        params = {k.lower(): v[0] for k, v in parse_qs(query).items() if v}
+    else:
+        if "://" not in raw:
+            raw = "https://" + raw
         try:
-            p = data["userPresences"][0]
-        except Exception:
-            return {"status": "api"}
-        if p.get("userPresenceType") != 2:
-            return {"status": "offline"}
-        if not (p.get("placeId") and p.get("gameId")):
-            return {"status": "hidden"}  # in a game, but Roblox hides the server (joins are off)
-        return {"status": "ok", "place": str(p["placeId"]), "job": str(p["gameId"])}
+            u = urlparse(raw)
+        except ValueError:
+            return None
+        if (u.hostname or "").lower() not in LINK_HOSTS:
+            return None
+        params = {k.lower(): v[0] for k, v in parse_qs(u.query).items() if v}
+        path = u.path or ""
+
+    if path.rstrip("/").lower() == "/share" or "code" in params and params.get("type", "").lower() == "server":
+        code = params.get("code", "")
+        if CODE_RE.match(code) and params.get("type", "server").lower() == "server":
+            return {"kind": "share", "code": code}
+        return None
+
+    place = params.get("placeid", "")
+    if not place:
+        m = re.match(r"^/(?:[a-z]{2}(?:-[a-z]{2})?/)?games/(\d+)", path, re.I)
+        place = m.group(1) if m else ""
+    if not place.isdigit():
+        return None
+    job = params.get("gameinstanceid", "")
+    code = params.get("linkcode") or params.get("privateserverlinkcode") or ""
+    if job and JOB_RE.match(job):
+        return {"kind": "public", "place": place, "job": job}
+    if code and CODE_RE.match(code):
+        return {"kind": "private", "place": place, "code": code}
+    return None
+
+
+def server_urls(srv):
+    """Returns (roseal_url or None, roblox_url) for a saved server dict."""
+    if not srv:
+        return None, None
+    kind = srv.get("kind")
+    if kind == "public":
+        return (f"https://www.roseal.live/join?placeId={srv['place']}&gameInstanceId={srv['job']}",
+                f"https://www.roblox.com/games/start?placeId={srv['place']}&gameInstanceId={srv['job']}")
+    if kind == "private":
+        return None, f"https://www.roblox.com/games/start?placeId={srv['place']}&linkCode={srv['code']}"
+    if kind == "share":
+        return None, f"https://www.roblox.com/share?code={srv['code']}&type=Server"
+    return None, None
+
+
+def server_label(srv) -> str:
+    return {"public": "Public server", "private": "Private server", "share": "Share link"}.get((srv or {}).get("kind"), "Not set")
 
 
 # ============================================================ card builders
@@ -265,6 +338,16 @@ async def notice(interaction: discord.Interaction, title: str, text, *, accent=R
             await interaction.response.send_message(view=view, ephemeral=True)
     except discord.HTTPException:
         pass
+
+
+async def guard(interaction: discord.Interaction, gid=None) -> bool:
+    """True when this server is authorized. Otherwise replies and returns False."""
+    gid = gid or interaction.guild_id
+    if is_authorized(gid):
+        return True
+    await notice(interaction, "Not Authorized",
+                 "> Rivalz is not authorized in this server yet. The bot owner needs to run `/authorize`.", accent=GREY)
+    return False
 
 
 async def try_dm(user, view):
@@ -402,6 +485,8 @@ def ticket_view(t, ping=False):
         info += f"> **Live Timer:** <t:{int(t['created'])}:R>\n> **Opened:** <t:{int(t['created'])}:t>"
     else:
         info += f"> **Duration:** `{match_duration(t)}`"
+    if t.get("server"):
+        info += f"\n> **Server:** `{server_label(t['server'])} set`"
     if t.get("vc_id"):
         info += f"\n> **Voice:** <#{t['vc_id']}>"
     c.add_item(discord.ui.Separator())
@@ -455,6 +540,7 @@ def challenge_dm_view(ch, requester):
             f"**Challenger:** {requester.mention} (`@{esc(requester.name)}`)",
             field("Mode", m["name"]),
             field("Rounds", rounds_text(ch["rounds"])),
+            field("Server", server_label(ch.get("server"))),
         ],
         [f"> This challenge expires <t:{int(ch['expires'])}:R>."],
     ]
@@ -490,6 +576,14 @@ async def send_to(cid: int, view, file=None, files=None):
         return None
 
 
+async def send_cfg(gid, key, view, file=None, files=None):
+    """Send to one of this server's saved channels (panel, log, results, ...)."""
+    cid = cfg_channel_id(gid, key)
+    if not cid:
+        return None
+    return await send_to(cid, view, file=file, files=files)
+
+
 async def log_opened(t):
     m = MODES[t["mode"]]
     p0, p1 = t["p"]
@@ -502,7 +596,7 @@ async def log_opened(t):
         ["-# Rivalz"],
     ]
     buttons = [discord.ui.Button(label="More Info", url=ticket_jump(t))]
-    await send_to(LOG_CHANNEL_ID, build_card(f"{m['name']}-ticket #{t['number']:03d} Opened", sections,
+    await send_cfg(t["guild_id"], "log", build_card(f"{m['name']}-ticket #{t['number']:03d} Opened", sections,
                                              accent=m["colour"], buttons=buttons))
 
 
@@ -517,14 +611,14 @@ async def log_closed(t, by_id):
         ["-# Rivalz"],
     ]
     buttons = [discord.ui.Button(label="More Info", url=ticket_jump(t))]
-    await send_to(LOG_CHANNEL_ID, build_card(f"{m['name']}-ticket #{t['number']:03d} Closed", sections,
+    await send_cfg(t["guild_id"], "log", build_card(f"{m['name']}-ticket #{t['number']:03d} Closed", sections,
                                              accent=GREY, buttons=buttons))
 
 
 def archive_of(t) -> dict:
     return {
         "mode": t["mode"], "number": t["number"], "rounds": t["rounds"], "p": t["p"], "scores": t["scores"],
-        "guild_id": t["guild_id"], "created": t["created"], "result_url": t.get("result_url"),
+        "guild_id": t["guild_id"], "created": t["created"], "result_url": t.get("result_url"), "server": t.get("server"),
         "reopened": False, "deleted_by": None, "deleted_at": 0,
     }
 
@@ -559,6 +653,8 @@ class ReopenButton(discord.ui.DynamicItem[discord.ui.Button], template=r"rv:reop
         print(f"ReopenButton error: {error!r}")
 
     async def callback(self, interaction: discord.Interaction):
+        if not await guard(interaction):
+            return
         a = store.d["archive"].get(self.key)
         if not a:
             return await notice(interaction, "Not Available", "> This ticket can no longer be re-opened.")
@@ -572,7 +668,7 @@ class ReopenButton(discord.ui.DynamicItem[discord.ui.Button], template=r"rv:reop
         store.save()
         p0, p1 = a["p"]
         ch = {
-            "id": "reopen", "mode": a["mode"], "rounds": a["rounds"],
+            "id": "reopen", "mode": a["mode"], "rounds": a["rounds"], "server": a.get("server"),
             "requester": p0["discord_id"], "opponent": p1["discord_id"],
             "req": {k: p0.get(k) for k in ("roblox_id", "roblox_name", "roblox_display")},
             "opp": {k: p1.get(k) for k in ("roblox_id", "roblox_name", "roblox_display")},
@@ -585,6 +681,8 @@ class ReopenButton(discord.ui.DynamicItem[discord.ui.Button], template=r"rv:reop
             print(f"Re-open failed: {exc!r}")
             return await notice(interaction, "Re-Open Failed",
                                 "> The ticket could not be re-opened. Both players must still be in the server.")
+        unrecord_match(a["guild_id"], a["mode"], a["number"])
+        schedule_lb_refresh(a["guild_id"])
         try:
             await interaction.message.edit(view=deleted_view(a, self.key, reopened_by=interaction.user.id),
                                            allowed_mentions=NO_PING)
@@ -639,7 +737,8 @@ async def update_result(t, by_id=None, force=False, files=None) -> bool:
         t["scored_by"] = by_id
         store.save()
     view = result_view(t)
-    chan = await get_channel_safe(RESULTS_CHANNEL_ID)
+    results_id = cfg_channel_id(t["guild_id"], "results")
+    chan = await get_channel_safe(results_id) if results_id else None
     if not chan:
         return False
     if t.get("result_msg"):
@@ -652,7 +751,7 @@ async def update_result(t, by_id=None, force=False, files=None) -> bool:
         except discord.HTTPException as exc:
             print(f"Could not edit the result card: {exc!r}")
             return False
-    msg = await send_to(RESULTS_CHANNEL_ID, view, files=files)
+    msg = await send_to(results_id, view, files=files)
     if msg:
         t["result_msg"], t["result_url"] = msg.id, msg.jump_url
         store.save()
@@ -672,7 +771,8 @@ async def create_ticket(guild: discord.Guild, ch, number=None):
     name = f"{m['prefix']}-{n:03d}"
     vc_name = f"{m['prefix'].title()} {n:03d}"
 
-    category = guild.get_channel(TICKET_CATEGORY_ID) or await guild.fetch_channel(TICKET_CATEGORY_ID)
+    cat_id = gcfg(guild.id)["cat"].get("tickets")
+    category = guild.get_channel(cat_id) if cat_id else None  # None = top of the channel list if /build was not run
     members = []
     for uid in (ch["requester"], ch["opponent"]):
         members.append(guild.get_member(uid) or await guild.fetch_member(uid))
@@ -720,7 +820,7 @@ async def create_ticket(guild: discord.Guild, ch, number=None):
     t = {
         "challenge": ch["id"], "guild_id": guild.id, "channel_id": channel.id, "vc_id": vc.id if vc else None,
         "mode": ch["mode"], "number": n, "name": name, "rounds": ch["rounds"], "created": int(time.time()),
-        "status": "open", "p": players, "scores": [None, None], "message_id": None,
+        "status": "open", "p": players, "scores": [None, None], "message_id": None, "server": ch.get("server"),
         "ended_at": None, "ended_by": None, "scored_at": None, "scored_by": None,
         "result_msg": None, "result_url": None,
         "gank_url": None, "gank_by": None, "gank_deadline": 0, "gank_msg": None,
@@ -790,6 +890,8 @@ class ChallengeButton(discord.ui.DynamicItem[discord.ui.Button], template=r"rv:(
                 view=build_card("Challenge Closed", ["> This challenge is no longer active."], accent=GREY))
         if interaction.user.id != ch["opponent"]:
             return await interaction.response.send_message("This challenge is not for you.", ephemeral=True)
+        if not await guard(interaction, ch["guild_id"]):
+            return
 
         m = MODES[ch["mode"]]
         if self.act == "dec":
@@ -852,7 +954,7 @@ class RivalNameModal(discord.ui.Modal):
 
 
 # ============================================================ request flow (panel -> modal -> challenge)
-async def submit_challenge(interaction: discord.Interaction, mode: str, rival, rounds: int):
+async def submit_challenge(interaction: discord.Interaction, mode: str, rival, rounds: int, server: dict):
     """interaction must already be deferred (ephemeral)."""
     guild = interaction.guild
     if rival.id == interaction.user.id:
@@ -877,7 +979,7 @@ async def submit_challenge(interaction: discord.Interaction, mode: str, rival, r
 
     ch = {
         "id": uuid.uuid4().hex[:8], "mode": mode, "status": "pending", "guild_id": guild.id,
-        "requester": interaction.user.id, "opponent": rival.id, "rounds": rounds,
+        "requester": interaction.user.id, "opponent": rival.id, "rounds": rounds, "server": server,
         "req": {k: prof.get(k) for k in ("roblox_id", "roblox_name", "roblox_display")},
         "created": time.time(), "expires": time.time() + EXPIRY_MINUTES * 60,
     }
@@ -895,7 +997,7 @@ async def submit_challenge(interaction: discord.Interaction, mode: str, rival, r
         "Challenge Sent",
         [[f"> Your **{m['name']}** request was delivered to {rival.mention}.",
           "> You will be notified once they respond."],
-         [field("Mode", m["name"]), field("Rounds", rounds_text(rounds))],
+         [field("Mode", m["name"]), field("Rounds", rounds_text(rounds)), field("Server", server_label(server))],
          [f"> Expires <t:{int(ch['expires'])}:R>."]],
         accent=m["colour"]), ephemeral=True)
 
@@ -926,12 +1028,21 @@ class ChallengeModal(discord.ui.Modal):
         )
         self.add_item(discord.ui.Label(text="Number of Rounds", component=self.rounds))
 
+        self.server = discord.ui.TextInput(placeholder="Roseal / Roblox server link", min_length=10, max_length=400)
+        self.add_item(discord.ui.Label(text="Server Link", description="Your server link. Your rival joins it from the ticket.",
+                                       component=self.server))
+
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
+        if not is_authorized(interaction.guild_id):
+            return await notice(interaction, "Not Authorized", "> Rivalz is not authorized in this server yet.", accent=GREY)
         rival = self.opponent.values[0]
         choice = self.rounds.values[0] if self.rounds.values else None
         if choice is None:
             return await notice(interaction, "Request Failed", "> Select the number of rounds.")
+        server = parse_server_link(self.server.value)
+        if not server:
+            return await notice(interaction, "Invalid Server Link", [SERVER_HELP, "> Copy the link again and press the mode again."])
 
         name = self.username.value.strip()
         saved = store.d["profiles"].get(str(interaction.user.id), {})
@@ -944,13 +1055,13 @@ class ChallengeModal(discord.ui.Modal):
             store.save()
 
         if choice != "custom":
-            return await submit_challenge(interaction, self.mode, rival, int(choice))
+            return await submit_challenge(interaction, self.mode, rival, int(choice), server)
 
         mode, rival_id = self.mode, rival.id
         button = discord.ui.Button(label="Enter Rounds", style=discord.ButtonStyle.primary)
 
         async def open_rounds(i: discord.Interaction):
-            await i.response.send_modal(CustomRoundsModal(mode, rival_id))
+            await i.response.send_modal(CustomRoundsModal(mode, rival_id, server))
 
         button.callback = open_rounds
         await interaction.followup.send(view=build_card(
@@ -964,9 +1075,9 @@ class ChallengeModal(discord.ui.Modal):
 
 
 class CustomRoundsModal(discord.ui.Modal):
-    def __init__(self, mode: str, rival_id: int):
+    def __init__(self, mode: str, rival_id: int, server: dict):
         super().__init__(title="Custom Rounds", timeout=600)
-        self.mode, self.rival_id = mode, rival_id
+        self.mode, self.rival_id, self.server = mode, rival_id, server
         self.value = discord.ui.TextInput(placeholder=f"1 to {MAX_ROUNDS}", min_length=1, max_length=3)
         self.add_item(discord.ui.Label(text="Number of Rounds", component=self.value))
 
@@ -979,7 +1090,7 @@ class CustomRoundsModal(discord.ui.Modal):
             rival = await interaction.guild.fetch_member(self.rival_id)
         except discord.NotFound:
             return await notice(interaction, "Request Failed", "> That rival is not in this server.")
-        await submit_challenge(interaction, self.mode, rival, int(raw))
+        await submit_challenge(interaction, self.mode, rival, int(raw), self.server)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         await safe_reply(interaction, "Something went wrong. Please try again.")
@@ -1022,50 +1133,38 @@ class TicketButton(discord.ui.DynamicItem[discord.ui.Button],
         t = store.d["tickets"].get(str(interaction.channel_id))
         if not t:
             return await safe_reply(interaction, "This ticket is no longer tracked by Rivalz.")
+        if not await guard(interaction, t["guild_id"]):
+            return
         await TICKET_HANDLERS[self.act](interaction, t)
 
 
-# ---------- join (live server lookup -> Roseal -> Roblox)
-def roseal_join_url(place, job) -> str:
-    return f"https://www.roseal.live/join?placeId={place}&gameInstanceId={job}"
-
-
-def roblox_join_url(place, job) -> str:
-    return f"https://www.roblox.com/games/start?placeId={place}&gameInstanceId={job}"
-
-
+# ---------- join (manual server link -> Roseal -> Roblox)
 async def h_join(interaction, t):
     if not can_act(t, interaction.user):
         return await notice(interaction, "Not Allowed", "> Only the two fighters can join this match.")
     if t["status"] != "open":
         return await notice(interaction, "Match Ended", "> This match has already ended.")
-    side = side_of(t, interaction.user.id)
-    target = t["p"][1] if side in (None, 0) else t["p"][0]  # join the OTHER player's live server
-    await interaction.response.defer(ephemeral=True)
-    res = await bot.roblox.live_server(target["roblox_id"])
-    name = target["roblox_name"]
-
-    if res["status"] == "ok":
-        place, job = res["place"], res["job"]
-        await interaction.followup.send(view=build_card(
-            "Join Match",
-            [[f"> Joining **{md(name)}**'s live server.",
-              "> Tap **Open Roseal**. Roseal opens first and then launches Roblox.",
-              "> If Roseal does not open, use **Open Roblox Directly**."],
-             [field("Server Of", name), field("Server ID", f"{job[:8]}...")]],
-            accent=GREEN, timeout=600,
-            buttons=[discord.ui.Button(label="Open Roseal", url=roseal_join_url(place, job)),
-                     discord.ui.Button(label="Open Roblox Directly", url=roblox_join_url(place, job))]), ephemeral=True)
-        return
-
-    reasons = {
-        "no_cookie": "> The bot has no Roblox account connected yet. Ask the developer to set `ROBLOX_COOKIE`.",
-        "api": "> Roblox did not answer. Try again in a moment.",
-        "offline": f"> **{md(name)}** is not in a Roblox game right now. Ask them to join the game, then press **Join** again.",
-        "hidden": (f"> **{md(name)}** is in a game, but their joins are off so the server cannot be read. "
-                   "They need Roblox Privacy > Who can join me set to **Everyone**."),
-    }
-    await notice(interaction, "Server Not Found", reasons.get(res["status"], reasons["api"]), accent=GREY)
+    srv = t.get("server")
+    roseal, roblox = server_urls(srv)
+    if not roblox:
+        return await notice(interaction, "No Server Link",
+                            "> This ticket has no server link (it was opened before links were added). "
+                            "Ask the challenger to send their server link in this channel.", accent=GREY)
+    host = t["p"][0]
+    buttons = []
+    if roseal:
+        buttons.append(discord.ui.Button(label="Open Roseal", url=roseal))
+    buttons.append(discord.ui.Button(label="Open Roblox Directly", url=roblox))
+    lines = [f"> Server link from **{md(host['roblox_name'])}**."]
+    if roseal:
+        lines += ["> Tap **Open Roseal**. Roseal opens first and then launches Roblox.",
+                  "> If Roseal does not open, use **Open Roblox Directly**."]
+    else:
+        lines += ["> Tap **Open Roblox Directly** to launch Roblox.",
+                  "> Roseal only supports public server links, so it is not shown for this one."]
+    await interaction.response.send_message(view=build_card(
+        "Join Match", [lines, [field("Server Type", server_label(srv))]],
+        accent=GREEN, timeout=600, buttons=buttons), ephemeral=True)
 
 
 async def h_prof(interaction, t):
@@ -1327,6 +1426,8 @@ async def h_end(interaction, t):
     t["gank_deadline"] = time.time() + GANK_SECONDS
     t["gank_url"] = None
     store.save()
+    if record_match(t):
+        schedule_lb_refresh(t["guild_id"])
     await interaction.response.edit_message(view=ticket_view(t))
     msg = await interaction.followup.send(view=gank_view(t, "waiting"), wait=True)
     t["gank_msg"] = msg.id
@@ -1391,7 +1492,7 @@ async def h_delete(interaction, t):
         store.d["archive"].pop(next(iter(store.d["archive"])))
     store.d["tickets"].pop(str(t["channel_id"]), None)
     store.save()
-    await send_to(LOG_CHANNEL_ID, deleted_view(a, key))
+    await send_cfg(t["guild_id"], "log", deleted_view(a, key))
 
     await asyncio.sleep(5)
     if t.get("vc_id"):
@@ -1443,7 +1544,7 @@ class ConfigModal(discord.ui.Modal):
 
 HELP_SECTIONS = [
     ["> Pick **Duel** or **Spar**, choose a rival and rounds. Your rival accepts in their DMs."],
-    ["`1` Select a mode and enter your Roblox username (saved for next time).",
+    ["`1` Select a mode, enter your Roblox username (saved for next time) and paste your **server link**.",
      "`2` Your rival presses **Accept** and a private ticket with a voice channel opens.",
      "`3` Fight, then each player adds their own score. The winner is declared automatically.",
      "`4` Press **End**. Send the gank image if you have one (optional), then press **Delete Ticket**."],
@@ -1458,7 +1559,7 @@ PANEL_MODES = (
 PANEL_HOW = (
     "### How it works\n"
     "> `1` Pick **Duel** or **Spar** below\n"
-    "> `2` Enter your username, rival and rounds\n"
+    "> `2` Enter your username, rival, rounds and server link\n"
     "> `3` Your rival accepts in their DMs\n"
     "> `4` Fight, add scores and finish"
 )
@@ -1469,6 +1570,8 @@ class SettingsButton(discord.ui.Button):
         super().__init__(label="Settings", style=discord.ButtonStyle.secondary, custom_id="rv:settings")
 
     async def callback(self, interaction: discord.Interaction):
+        if not await guard(interaction):
+            return
         prof = store.d["profiles"].get(str(interaction.user.id), {})
         await interaction.response.send_modal(ConfigModal(prof))
 
@@ -1478,6 +1581,8 @@ class HelpButton(discord.ui.Button):
         super().__init__(label="Help", style=discord.ButtonStyle.primary, custom_id="rv:help")
 
     async def callback(self, interaction: discord.Interaction):
+        if not await guard(interaction):
+            return
         await interaction.response.send_message(
             view=build_card("Matchmaking Guide", HELP_SECTIONS, timeout=600), ephemeral=True)
 
@@ -1494,6 +1599,8 @@ class ModeSelect(discord.ui.Select):
         )
 
     async def callback(self, interaction: discord.Interaction):
+        if not await guard(interaction):
+            return
         mode = self.values[0]
         prof = store.d["profiles"].get(str(interaction.user.id), {})
         await interaction.response.send_modal(ChallengeModal(mode, prof))
@@ -1528,11 +1635,35 @@ class PanelView(discord.ui.LayoutView):
 
 
 # ============================================================ bot
+class GuardedTree(app_commands.CommandTree):
+    """Slash commands only work in authorized servers (the owner can always use them)."""
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == OWNER_ID or is_authorized(interaction.guild_id):
+            return True
+        await safe_reply(interaction, "Rivalz is not authorized in this server yet. The bot owner needs to run /authorize.")
+        return False
+
+
+def migrate_legacy():
+    """Your original server keeps working: it is marked authorized and keeps its existing channels and categories."""
+    for guild in bot.guilds:
+        if str(guild.id) in store.d["guilds"] or not guild.get_channel(LEGACY["panel"]):
+            continue
+        g = gcfg(guild.id)
+        g["authorized"], g["legacy"] = True, True
+        for key in ("panel", "log", "results", "duel_lb", "spar_lb"):
+            if guild.get_channel(LEGACY[key]):
+                g["ch"][key] = LEGACY[key]
+        g["cat"].update(main=LEGACY["cat_main"], tickets=LEGACY["cat_tickets"])
+        print(f"Moved {guild.name} onto the per-server setup.")
+    store.save()
+
+
 class Rivalz(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True  # needed to read the gank image
-        super().__init__(command_prefix=commands.when_mentioned, intents=intents)
+        super().__init__(command_prefix=commands.when_mentioned, intents=intents, tree_cls=GuardedTree)
         self.session: aiohttp.ClientSession = None
         self.roblox: RobloxClient = None
         self._ready_once = False
@@ -1540,7 +1671,7 @@ class Rivalz(commands.Bot):
     async def setup_hook(self):
         self.session = aiohttp.ClientSession()
         self.roblox = RobloxClient(self.session)
-        self.add_dynamic_items(ChallengeButton, TicketButton, ReopenButton, OpenGankButton)
+        self.add_dynamic_items(ChallengeButton, TicketButton, ReopenButton, OpenGankButton, LbButton)
         await self.tree.sync()
         expiry_loop.start()
 
@@ -1551,17 +1682,36 @@ class Rivalz(commands.Bot):
 
     async def on_ready(self):
         print(f"Rivalz online as {self.user} ({self.user.id})")
-        if not self._ready_once:
-            self._ready_once = True
-            await post_panel()
+        if self._ready_once:
+            return
+        self._ready_once = True
+        migrate_legacy()
+        backfill_matches()
+        for guild in self.guilds:
+            gcfg(guild.id)
+            await ensure_readme(guild)
+            if is_authorized(guild.id) and gcfg(guild.id)["ch"].get("panel"):
+                await post_panel(guild)
+        store.save()
+        lb_loop.start()  # draws the leaderboards now and then every 10 minutes
+
+    async def on_guild_join(self, guild: discord.Guild):
+        gcfg(guild.id)
+        store.save()
+        await ensure_readme(guild)
+        await tell_owner(f"Rivalz joined **{guild.name}** (`{guild.id}`). Run `/authorize` there, then `/build`.")
 
 
 bot = Rivalz()
 
 
-async def post_panel():
+async def post_panel(guild) -> bool:
+    channel_id = cfg_channel_id(guild.id, "panel")
+    if not channel_id:
+        print(f"{guild.name}: no panel channel yet (run /build).")
+        return False
     try:
-        channel = bot.get_channel(PANEL_CHANNEL_ID) or await bot.fetch_channel(PANEL_CHANNEL_ID)
+        channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
         try:
             async for message in channel.history(limit=50):
                 if message.author.id == bot.user.id:
@@ -1571,18 +1721,20 @@ async def post_panel():
                         pass
         except discord.Forbidden:
             print("Missing Read Message History in the panel channel; old panels were not removed.")
-        if os.path.exists(GIF_PATH):
+        if GIF_PATH and os.path.exists(GIF_PATH):
             await channel.send(view=PanelView(), file=discord.File(GIF_PATH, filename="panel.gif"))
         else:
             print("panel.gif not found next to main.py (or in assets/), posting the panel without the banner.")
             await channel.send(view=PanelView())
-        print("Panel posted.")
+        print(f"Panel posted in {guild.name}.")
+        return True
     except discord.Forbidden:
         print("Could not post the panel: the bot needs View Channel and Send Messages in the panel channel.")
     except discord.NotFound:
-        print("Could not post the panel: PANEL_CHANNEL_ID is wrong or the bot is not in that server.")
+        print("Could not post the panel: the panel channel no longer exists (run /build).")
     except Exception as exc:
         print(f"Could not post the panel: {exc!r}")
+    return False
 
 
 @tasks.loop(seconds=60)
@@ -1614,6 +1766,622 @@ async def _wait_ready():
     await bot.wait_until_ready()
 
 
+# ============================================================ leaderboard image (Pillow)
+FONT_DIRS = (os.path.join(BASE_DIR, "assets", "fonts"), os.path.join(BASE_DIR, "fonts"), BASE_DIR)
+FONT_FILES = {
+    "bold": ("Poppins-Bold.ttf", "DejaVuSans-Bold.ttf"),
+    "medium": ("Poppins-Medium.ttf", "DejaVuSans.ttf"),
+    "regular": ("Poppins-Regular.ttf", "DejaVuSans.ttf"),
+}
+_FONTS = {}
+
+
+def lb_font(weight: str, size: int):
+    from PIL import ImageFont
+    key = (weight, size)
+    if key in _FONTS:
+        return _FONTS[key]
+    font = None
+    for name in FONT_FILES[weight]:
+        for folder in FONT_DIRS + ("/usr/share/fonts/truetype/dejavu", "/usr/share/fonts/dejavu", "/Library/Fonts",
+                                   "C:\\Windows\\Fonts"):
+            path = os.path.join(folder, name)
+            if os.path.isfile(path):
+                try:
+                    font = ImageFont.truetype(path, size)
+                    break
+                except Exception:
+                    font = None
+        if font:
+            break
+    if font is None:
+        try:
+            font = ImageFont.load_default(size=size)  # Pillow 10.1+
+        except TypeError:
+            font = ImageFont.load_default()
+    _FONTS[key] = font
+    return font
+
+
+LB_W = 1000
+LB_ROWS_PER_PAGE = 7
+LB_PERIODS = {"day": "Daily", "week": "Weekly", "month": "Monthly", "all": "All-time"}
+C_BG1, C_BG2 = (9, 22, 29), (14, 44, 56)
+C_CARD, C_CARD_LINE = (17, 38, 46), (31, 100, 112)
+C_PANEL, C_ROW, C_ROW_LINE = (18, 53, 64), (22, 38, 46), (42, 68, 82)
+C_TAB_BG, C_TAB_ON = (27, 43, 51), (14, 143, 168)
+C_TEXT, C_MUTED, C_CYAN = (236, 244, 247), (130, 150, 160), (34, 211, 238)
+C_GOLD, C_SILVER, C_BRONZE = (246, 212, 66), (168, 182, 198), (217, 138, 43)
+
+
+def _rounded_avatar(data, size, radius, fallback_text="?", tint=(60, 90, 110)):
+    from PIL import Image, ImageDraw
+    im = None
+    if data:
+        try:
+            im = Image.open(io.BytesIO(data)).convert("RGBA").resize((size, size), Image.LANCZOS)
+        except Exception:
+            im = None
+    if im is None:
+        im = Image.new("RGBA", (size, size), tint + (255,))
+        d = ImageDraw.Draw(im)
+        f = lb_font("bold", int(size * 0.5))
+        d.text((size / 2, size / 2), (fallback_text or "?")[:1].upper(), font=f, fill=C_TEXT, anchor="mm")
+    mask = Image.new("L", (size, size), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, size - 1, size - 1), radius=radius, fill=255)
+    out = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    out.paste(im, (0, 0), mask)
+    return out
+
+
+def _fit_text(draw, text, font_weight, size, max_w, min_size=14):
+    while size > min_size:
+        f = lb_font(font_weight, size)
+        if draw.textlength(text, font=f) <= max_w:
+            return f, text
+        size -= 2
+    f = lb_font(font_weight, min_size)
+    while text and draw.textlength(text + "...", font=f) > max_w:
+        text = text[:-1]
+    return f, text + "..."
+
+
+def _crown(draw, cx, base_y, w=120, h=64):
+    x0, x1 = cx - w // 2, cx + w // 2
+    top = base_y - h
+    pts = [(x0, base_y), (x0 - 8, top + 14), (x0 + w * 0.22, top + h * 0.45), (cx, top),
+           (x1 - w * 0.22, top + h * 0.45), (x1 + 8, top + 14), (x1, base_y)]
+    draw.polygon(pts, fill=C_GOLD)
+    draw.rectangle((x0, base_y - 10, x1, base_y), fill=(214, 172, 36))
+    for px, py in ((x0 - 8, top + 14), (cx, top), (x1 + 8, top + 14)):
+        draw.ellipse((px - 7, py - 7, px + 7, py + 7), fill=(255, 232, 120))
+
+
+def _medal(draw, cx, cy, colour, r=24):
+    import math
+    pts = [(cx + r * math.cos(math.radians(60 * i - 30)), cy + r * math.sin(math.radians(60 * i - 30))) for i in range(6)]
+    draw.polygon(pts, fill=colour)
+    inner = [(cx + (r - 8) * math.cos(math.radians(60 * i - 30)), cy + (r - 8) * math.sin(math.radians(60 * i - 30)))
+             for i in range(6)]
+    draw.polygon(inner, fill=tuple(max(0, c - 70) for c in colour))
+
+
+def render_leaderboard(mode_name, period, page, pages, entries, podium, viewer=None, avatars=None):
+    """entries: list of dicts (rank, uid, name, w, l) for this page's rows.
+    podium: list of up to 3 such dicts (page 1 only). viewer: dict(rank,name,w,l,uid,up) or None.
+    avatars: {uid: bytes}."""
+    from PIL import Image, ImageDraw, ImageFilter
+    avatars = avatars or {}
+    show_podium = page == 0
+    row_h, gap = 92, 14
+
+    # ---- layout height
+    y = 225
+    if show_podium:
+        y = 700 + 30
+    if viewer:
+        y += 92 + gap + 8
+    y += len(entries) * (row_h + gap)
+    if not show_podium and not entries:
+        y += 140
+    height = y + 100
+
+    im = Image.new("RGB", (LB_W, height), C_BG1)
+    strip = Image.new("RGB", (1, height))
+    for yy in range(height):  # vertical gradient
+        t = yy / max(1, height - 1)
+        strip.putpixel((0, yy), tuple(int(C_BG1[i] + (C_BG2[i] - C_BG1[i]) * t) for i in range(3)))
+    im = strip.resize((LB_W, height))
+    d = ImageDraw.Draw(im, "RGBA")
+
+    # ---- card
+    d.rounded_rectangle((40, 40, LB_W - 40, height - 40), radius=34, fill=C_CARD + (235,), outline=C_CARD_LINE, width=3)
+    d.text((LB_W / 2, 92), "Leaderboard", font=lb_font("bold", 40), fill=C_TEXT, anchor="mm")
+
+    # ---- tabs
+    d.rounded_rectangle((168, 132, 832, 188), radius=18, fill=C_TAB_BG)
+    tab_w = (832 - 168 - 20) / 4
+    for i, (key, label) in enumerate(LB_PERIODS.items()):
+        x0 = 178 + i * tab_w
+        if key == period:
+            d.rounded_rectangle((x0, 140, x0 + tab_w - 4, 180), radius=12, fill=C_TAB_ON)
+        d.text((x0 + (tab_w - 4) / 2, 160), label, font=lb_font("medium", 22), fill=C_TEXT, anchor="mm")
+
+    # ---- podium
+    if show_podium:
+        d.rounded_rectangle((62, 215, LB_W - 62, 700), radius=40, fill=C_PANEL, outline=(34, 150, 170), width=2,
+                            corners=(False, False, True, True))
+        slots = {1: (500, 400, 220, C_GOLD), 2: (240, 395, 156, C_SILVER), 3: (760, 395, 156, C_BRONZE)}
+        by_rank = {e["rank"]: e for e in podium}
+        for rank, (cx, cy, size, colour) in slots.items():
+            e = by_rank.get(rank)
+            top = cy - size // 2
+            glow = Image.new("RGBA", (size + 80, size + 80), (0, 0, 0, 0))
+            ImageDraw.Draw(glow).rounded_rectangle((40, 40, size + 40, size + 40), radius=36, fill=colour + (70,))
+            glow = glow.filter(ImageFilter.GaussianBlur(14))
+            im.paste(glow, (cx - size // 2 - 40, top - 40), glow)
+            d = ImageDraw.Draw(im, "RGBA")
+            border = 6 if rank == 1 else 4
+            d.rounded_rectangle((cx - size // 2 - border, top - border, cx + size // 2 + border, top + size + border),
+                                radius=int(size * 0.2) + border, fill=colour if e else (60, 80, 90))
+            av = _rounded_avatar(avatars.get(e["uid"]) if e else None, size, int(size * 0.2),
+                                 (e or {}).get("name", "?"), tint={1: (14, 130, 160), 2: (50, 90, 150), 3: (170, 110, 40)}[rank])
+            im.paste(av, (cx - size // 2, top), av)
+            d = ImageDraw.Draw(im, "RGBA")
+            if rank == 1:
+                _crown(d, cx, top - 6)
+            else:
+                _medal(d, cx, top - 28, colour)
+            name_y = top + size + 26
+            if e:
+                f, txt = _fit_text(d, f"@{e['name']}", "medium", 26 if rank == 1 else 22, 230)
+                d.text((cx, name_y), txt, font=f, fill=colour, anchor="mm")
+                d.text((cx, name_y + 36), f"{e['w']} Wins", font=lb_font("bold", 30 if rank == 1 else 26), fill=colour, anchor="mm")
+                d.text((cx, name_y + 70), f"W {e['w']}   L {e['l']}", font=lb_font("regular", 18), fill=C_MUTED, anchor="mm")
+            else:
+                d.text((cx, name_y + 10), "No one yet", font=lb_font("medium", 20), fill=C_MUTED, anchor="mm")
+        d.text((LB_W / 2, 668), f"Ranked by wins  |  {mode_name}", font=lb_font("regular", 18), fill=C_MUTED, anchor="mm")
+        y = 730
+    else:
+        y = 225
+
+    def draw_row(y, e, label_name=None, sub=None, highlight=False):
+        box = (60, y, LB_W - 60, y + row_h)
+        if highlight:
+            d.rounded_rectangle(box, radius=24, fill=(15, 58, 71), outline=C_CYAN, width=2)
+        else:
+            d.rounded_rectangle(box, radius=24, fill=C_ROW, outline=C_ROW_LINE, width=2)
+        d.text((105, y + row_h / 2), str(e["rank"]) if e["rank"] else "-", font=lb_font("bold", 30), fill=C_TEXT, anchor="mm")
+        av = _rounded_avatar(avatars.get(e["uid"]), 64, 14, e.get("name", "?"))
+        im.paste(av, (152, y + 14), av)
+        title = label_name or f"@{e['name']}"
+        f, txt = _fit_text(d, title, "medium", 26, 520)
+        d.text((235, y + 30), txt, font=f, fill=C_TEXT, anchor="lm")
+        d.text((235, y + 62), sub or f"W {e['w']}  L {e['l']}", font=lb_font("regular", 19), fill=C_MUTED, anchor="lm")
+        d.text((LB_W - 96, y + row_h / 2), f"{e['w']} Wins", font=lb_font("bold", 28), fill=C_CYAN, anchor="rm")
+
+    if viewer:
+        if viewer["rank"]:
+            sub = f"W {viewer['w']}  L {viewer['l']}"
+            if viewer.get("up"):
+                sub += f"   |   Rank up in {viewer['up']} win{'s' if viewer['up'] != 1 else ''}"
+            else:
+                sub += "   |   You are #1"
+        else:
+            sub = "Win a match to get ranked"
+        draw_row(y, {"rank": viewer["rank"], "uid": viewer["uid"], "name": viewer["name"], "w": viewer["w"], "l": viewer["l"]},
+                 label_name="Your Current Rank", sub=sub, highlight=True)
+        y += 92 + gap + 8
+
+    if not entries and not (show_podium and podium):
+        d.text((LB_W / 2, y + 60), "No matches recorded yet", font=lb_font("medium", 26), fill=C_MUTED, anchor="mm")
+        y += 140
+    for e in entries:
+        draw_row(y, e)
+        y += row_h + gap
+
+    d.text((LB_W / 2, y + 22), f"Page {page + 1} of {pages}", font=lb_font("regular", 20), fill=C_MUTED, anchor="mm")
+    out = io.BytesIO()
+    im.save(out, "PNG", optimize=False)
+    return out.getvalue()
+
+
+# ============================================================ match stats (feeds the leaderboards)
+def period_start(period: str) -> float:
+    now = datetime.now(timezone.utc)
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if period == "day":
+        return midnight.timestamp()
+    if period == "week":
+        return (midnight - timedelta(days=now.weekday())).timestamp()
+    if period == "month":
+        return midnight.replace(day=1).timestamp()
+    return 0.0
+
+
+def unrecord_match(gid, mode, number) -> int:
+    before = len(store.d["matches"])
+    store.d["matches"] = [x for x in store.d["matches"] if not (x["g"] == gid and x["m"] == mode and x["n"] == number)]
+    removed = before - len(store.d["matches"])
+    if removed:
+        store.save()
+    return removed
+
+
+def match_row(t, ts):
+    w = winner_index(t)
+    if w is None:
+        return None
+    return {"g": t["guild_id"], "m": t["mode"], "n": t["number"], "ts": int(ts),
+            "w": t["p"][w]["discord_id"], "l": t["p"][1 - w]["discord_id"],
+            "ws": t["scores"][w], "ls": t["scores"][1 - w]}
+
+
+def record_match(t) -> bool:
+    """Called when a ticket ends. Only decided matches count (a draw or a missing score counts for nobody)."""
+    row = match_row(t, time.time())
+    if not row:
+        return False
+    unrecord_match(row["g"], row["m"], row["n"])  # never count one ticket twice
+    store.d["matches"].append(row)
+    store.save()
+    return True
+
+
+def backfill_matches():
+    """One time: turn matches that were already saved (deleted + still open tickets) into leaderboard records."""
+    if store.d.get("matches_backfilled"):
+        return
+    seen = {(x["g"], x["m"], x["n"]) for x in store.d["matches"]}
+    sources = [(a, a.get("created", 0)) for a in store.d["archive"].values()]
+    sources += [(t, t.get("ended_at") or t["created"]) for t in store.d["tickets"].values()
+                if t.get("status") in ("ended", "finished")]
+    for src, ts in sources:
+        try:
+            row = match_row(src, ts)
+        except Exception:
+            row = None
+        if row and (row["g"], row["m"], row["n"]) not in seen:
+            seen.add((row["g"], row["m"], row["n"]))
+            store.d["matches"].append(row)
+    store.d["matches_backfilled"] = True
+    store.save()
+
+
+def standings(gid, mode, period):
+    since = period_start(period)
+    tally = {}
+    for x in store.d["matches"]:
+        if x["g"] != gid or x["m"] != mode or x["ts"] < since:
+            continue
+        tally.setdefault(x["w"], [0, 0])[0] += 1
+        tally.setdefault(x["l"], [0, 0])[1] += 1
+    return sorted(((uid, w, l) for uid, (w, l) in tally.items()), key=lambda r: (-r[1], r[2], r[0]))
+
+
+def rank_info(rows, uid):
+    """(rank, wins, losses, top_percent) for a user, or None when unranked."""
+    for i, (u, w, l) in enumerate(rows):
+        if u == uid:
+            return i + 1, w, l, (i + 1) / len(rows) * 100
+    return None
+
+
+USER_CACHE = {}
+
+
+async def lookup_user(uid):
+    hit = USER_CACHE.get(uid)
+    if hit and time.time() - hit[0] < 3600:
+        return hit[1], hit[2]
+    name, data = f"user{str(uid)[-4:]}", None
+    try:
+        user = bot.get_user(uid) or await bot.fetch_user(uid)
+        name = user.name
+        data = await user.display_avatar.replace(size=128, format="png").read()
+    except Exception:
+        pass
+    USER_CACHE[uid] = (time.time(), name, data)
+    return name, data
+
+
+async def render_board(guild, mode, period, page, viewer=None):
+    """Returns (png bytes, total pages, page used)."""
+    rows = standings(guild.id, mode, period)
+    pages = max(1, math.ceil(max(0, len(rows) - 3) / LB_ROWS_PER_PAGE))
+    page = min(max(page, 0), pages - 1)
+    start = 3 + page * LB_ROWS_PER_PAGE
+    podium_rows = rows[:3] if page == 0 else []
+    list_rows = rows[start:start + LB_ROWS_PER_PAGE]
+    ids = {r[0] for r in podium_rows + list_rows}
+    if viewer:
+        ids.add(viewer.id)
+    ids = list(ids)
+    found = await asyncio.gather(*(lookup_user(u) for u in ids))
+    names = {u: f[0] for u, f in zip(ids, found)}
+    avatars = {u: f[1] for u, f in zip(ids, found) if f[1]}
+
+    def entry(rank, r):
+        return {"rank": rank, "uid": r[0], "name": names.get(r[0], "unknown"), "w": r[1], "l": r[2]}
+
+    podium = [entry(i + 1, r) for i, r in enumerate(podium_rows)]
+    entries = [entry(start + i + 1, r) for i, r in enumerate(list_rows)]
+    view_row = None
+    if viewer:
+        info = rank_info(rows, viewer.id)
+        if info:
+            above = rows[info[0] - 2][1] if info[0] > 1 else None
+            view_row = {"rank": info[0], "uid": viewer.id, "name": names.get(viewer.id, viewer.name), "w": info[1],
+                        "l": info[2], "up": max(1, above - info[1] + 1) if above is not None else 0}
+        else:
+            view_row = {"rank": 0, "uid": viewer.id, "name": names.get(viewer.id, viewer.name), "w": 0, "l": 0, "up": 0}
+    png = await asyncio.to_thread(render_leaderboard, MODES[mode]["name"], period, page, pages,
+                                  entries, podium, view_row, avatars)
+    return png, pages, page
+
+
+# ============================================================ leaderboard buttons
+class LbButton(discord.ui.DynamicItem[discord.ui.Button],
+               template=r"rv:lb:(?P<kind>per|prev|next|me):(?P<mode>duel|spar):(?P<period>day|week|month|all):(?P<page>\d+)"):
+    def __init__(self, kind, mode, period, page=0, *, label=None, style=None, disabled=False, row=None):
+        if label is None:
+            label = {"per": LB_PERIODS[period], "prev": "◀", "next": "▶", "me": "My Rank"}[kind]
+        if style is None:
+            style = discord.ButtonStyle.success if kind == "me" else discord.ButtonStyle.secondary
+        super().__init__(discord.ui.Button(label=label, style=style, disabled=disabled, row=row,
+                                           custom_id=f"rv:lb:{kind}:{mode}:{period}:{page}"))
+        self.kind, self.mode, self.period, self.page = kind, mode, period, page
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        return cls(match["kind"], match["mode"], match["period"], int(match["page"]))
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        await safe_reply(interaction, "Something went wrong. Please try again.")
+        print(f"LbButton error: {error!r}")
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.guild or not await guard(interaction):
+            return
+        if self.kind == "me":
+            return await send_my_rank(interaction, self.mode)
+        already_private = bool(interaction.message and interaction.message.flags.ephemeral)
+        if already_private:
+            await interaction.response.defer()  # edit this private board in place
+        else:
+            await interaction.response.defer(ephemeral=True)  # open a private board for this player only
+        png, pages, page = await render_board(interaction.guild, self.mode, self.period, self.page, interaction.user)
+        file = discord.File(io.BytesIO(png), filename="leaderboard.png")
+        view = lb_view(self.mode, self.period, page, pages, public=False)
+        if already_private:
+            await interaction.edit_original_response(attachments=[file], view=view)
+        else:
+            await interaction.followup.send(file=file, view=view, ephemeral=True)
+
+
+def lb_view(mode, period, page, pages, public):
+    view = discord.ui.View(timeout=None if public else 600)
+    for key in LB_PERIODS:
+        view.add_item(LbButton("per", mode, key, 0, row=0,
+                               style=discord.ButtonStyle.primary if key == period else discord.ButtonStyle.secondary))
+    if public:
+        view.add_item(LbButton("me", mode, period, 0, row=0))
+        return view
+    view.add_item(LbButton("prev", mode, period, max(0, page - 1), row=1, disabled=page <= 0))
+    view.add_item(discord.ui.Button(label=f"Page {page + 1} / {pages}", disabled=True, row=1))
+    view.add_item(LbButton("next", mode, period, min(pages - 1, page + 1), row=1, disabled=page >= pages - 1))
+    view.add_item(LbButton("me", mode, period, 0, row=1))
+    return view
+
+
+async def send_my_rank(interaction: discord.Interaction, mode: str):
+    await interaction.response.defer(ephemeral=True)
+    gid, user = interaction.guild.id, interaction.user
+    m = MODES[mode]
+    overall = rank_info(standings(gid, mode, "all"), user.id)
+    if overall:
+        top = [f"> **User:** `@{esc(user.name)}`",
+               f"> **Rank:** #{overall[0]} (Top {overall[3]:.2f}%)",
+               f"> **Wins:** {overall[1]}",
+               f"> **Losses:** {overall[2]}"]
+    else:
+        top = [f"> **User:** `@{esc(user.name)}`", "> **Rank:** Unranked", f"> **Wins:** 0",
+               f"> Win a {m['name']} to get on the board."]
+    lines = []
+    for key in ("day", "week", "month"):
+        info = rank_info(standings(gid, mode, key), user.id)
+        label = LB_PERIODS[key]
+        lines.append(f"> **{label}:** " + (f"#{info[0]} (Top {info[3]:.2f}%) | {info[1]}W {info[2]}L" if info else "Unranked"))
+    await interaction.followup.send(view=build_card(
+        f"📊 Your Current Stats ({m['name']})", [top, lines], accent=m["colour"]), ephemeral=True)
+
+
+async def refresh_leaderboards(guild, repost=False):
+    """Draw the Duel and Spar boards into their channels (edits the one message the bot keeps there)."""
+    cfg = gcfg(guild.id)
+    for mode in LB_MODES:
+        cid = cfg["ch"].get(f"{mode}_lb")
+        chan = (guild.get_channel(cid) if cid else None)
+        if not chan:
+            continue
+        try:
+            png, pages, _ = await render_board(guild, mode, "day", 0, None)
+        except Exception as exc:
+            print(f"Could not draw the {mode} leaderboard: {exc!r}")
+            continue
+        view = lb_view(mode, "day", 0, pages, public=True)
+        msg_id = cfg["lb_msg"].get(mode)
+        if repost:
+            try:
+                async for message in chan.history(limit=30):
+                    if message.author.id == bot.user.id:
+                        try:
+                            await message.delete()
+                        except discord.HTTPException:
+                            pass
+            except discord.HTTPException:
+                pass
+            msg_id = None
+        if msg_id:
+            try:
+                await chan.get_partial_message(msg_id).edit(
+                    attachments=[discord.File(io.BytesIO(png), filename="leaderboard.png")], view=view)
+                continue
+            except discord.NotFound:
+                pass
+            except discord.HTTPException as exc:
+                print(f"Could not update the {mode} leaderboard: {exc!r}")
+                continue
+        try:
+            msg = await chan.send(file=discord.File(io.BytesIO(png), filename="leaderboard.png"), view=view)
+            cfg["lb_msg"][mode] = msg.id
+            store.save()
+        except discord.HTTPException as exc:
+            print(f"Could not post the {mode} leaderboard (needs View Channel, Send Messages, Attach Files): {exc!r}")
+
+
+LB_TASKS = {}
+
+
+def schedule_lb_refresh(gid):
+    """Refresh a few seconds after a match is recorded (several matches in a row become one refresh)."""
+    old = LB_TASKS.get(gid)
+    if old and not old.done():
+        return
+
+    async def later():
+        await asyncio.sleep(8)
+        guild = bot.get_guild(gid)
+        if guild and is_authorized(gid):
+            await refresh_leaderboards(guild)
+
+    LB_TASKS[gid] = asyncio.create_task(later())
+
+
+@tasks.loop(minutes=10)
+async def lb_loop():
+    for guild in list(bot.guilds):
+        if is_authorized(guild.id):
+            await refresh_leaderboards(guild)  # also rolls Daily/Weekly/Monthly over when the period changes
+
+
+# ============================================================ read-me channel + /authorize + /build
+README_TEXT = ("Welcome to **Rivalz**. Rivalz coordinates Duel and Spar matchmaking, tracks every score, "
+               "and ranks fighters on the Duel and Spar leaderboards.")
+
+
+def readme_view(gid):
+    ok = is_authorized(gid)
+    sections = [[f"**Status:** {'Authorized' if ok else 'Not Authorized'}"], [README_TEXT]]
+    if not ok:
+        sections.append(["-# The bot owner must run `/authorize` before Rivalz can be used in this server."])
+    elif not gcfg(gid)["ch"].get("panel"):
+        sections.append(["-# The bot owner must run `/build` to create the Rivalz channels."])
+    buttons = [discord.ui.Button(label="Developer Profile", url=DEVELOPER_URL)] if DEVELOPER_URL else None
+    return build_card("Rivalz", sections, accent=GREEN if ok else GREY, buttons=buttons)
+
+
+async def tell_owner(text):
+    try:
+        owner = await bot.fetch_user(OWNER_ID)
+        await owner.send(text)
+    except Exception:
+        pass
+
+
+async def ensure_readme(guild):
+    """Create the read-me channel (once) and keep its status card up to date."""
+    rd = gcfg(guild.id)["readme"]
+    chan = guild.get_channel(rd["channel"]) if rd.get("channel") else None
+    if chan is None:
+        if not guild.me.guild_permissions.manage_channels:
+            print(f"Cannot create read-me in {guild.name}: missing Manage Channels.")
+            await tell_owner(f"Rivalz joined **{guild.name}** but needs **Manage Channels** to create the read-me channel.")
+            return
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(
+                view_channel=True, read_message_history=True, send_messages=False, add_reactions=False,
+                create_public_threads=False, create_private_threads=False),
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True,
+                                                  read_message_history=True, manage_channels=True),
+        }
+        try:
+            chan = await guild.create_text_channel("read-me", overwrites=overwrites, topic="About Rivalz",
+                                                   reason="Rivalz read-me")
+        except discord.HTTPException as exc:
+            print(f"Could not create read-me in {guild.name}: {exc!r}")
+            return
+        rd["channel"], rd["message"] = chan.id, None
+    view = readme_view(guild.id)
+    if rd.get("message"):
+        try:
+            await chan.get_partial_message(rd["message"]).edit(view=view)
+            store.save()
+            return
+        except discord.NotFound:
+            pass
+        except discord.HTTPException as exc:
+            print(f"Could not update read-me in {guild.name}: {exc!r}")
+            return
+    try:
+        msg = await chan.send(view=view)
+        rd["message"] = msg.id
+    except discord.HTTPException as exc:
+        print(f"Could not post read-me in {guild.name}: {exc!r}")
+    store.save()
+
+
+async def build_guild(guild):
+    """Create (or reuse) every category and channel Rivalz needs. Safe to run again: it only fills what is missing."""
+    cfg = gcfg(guild.id)
+    chs, cats = cfg["ch"], cfg["cat"]
+    created, kept = [], []
+    me = guild.me
+    staff = guild.get_role(STAFF_ROLE_ID) if STAFF_ROLE_ID else None
+    bot_ow = discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True, attach_files=True,
+                                         read_message_history=True, manage_channels=True)
+    read_only = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=True, read_message_history=True, send_messages=False,
+                                                        add_reactions=False, create_public_threads=False,
+                                                        create_private_threads=False),
+        me: bot_ow,
+    }
+    private = {guild.default_role: discord.PermissionOverwrite(view_channel=False), me: bot_ow}
+    if staff:
+        private[staff] = discord.PermissionOverwrite(view_channel=True, read_message_history=True)
+
+    async def category(key, name, overwrites):
+        c = guild.get_channel(cats[key]) if cats.get(key) else None
+        if isinstance(c, discord.CategoryChannel):
+            kept.append(f"Category **{c.name}**")
+            return c
+        c = await guild.create_category(name, overwrites=overwrites, reason="Rivalz /build")
+        cats[key] = c.id
+        created.append(f"Category **{c.name}**")
+        return c
+
+    async def text(key, name, parent, overwrites, topic):
+        c = guild.get_channel(chs[key]) if chs.get(key) else None
+        if isinstance(c, discord.TextChannel):
+            kept.append(c.mention)
+            return c
+        c = await guild.create_text_channel(name, category=parent, overwrites=overwrites, topic=topic, reason="Rivalz /build")
+        chs[key] = c.id
+        created.append(c.mention)
+        return c
+
+    main = await category("main", "RIVALZ", {})
+    await text("panel", "matchmaking", main, read_only, "Start a Duel or Spar from here.")
+    await text("results", "results", main, read_only, "Finished match results.")
+    await text("log", "match-logs", main, private, "Rivalz ticket logs (staff only).")
+    boards = await category("lb", "LEADERBOARDS", {})
+    await text("duel_lb", "duel-leaderboard", boards, read_only, "Duel leaderboard, ranked by wins.")
+    await text("spar_lb", "spar-leaderboard", boards, read_only, "Spar leaderboard, ranked by wins.")
+    await category("tickets", "TICKETS", private)
+    store.save()
+    return created, kept
+
+
 # ============================================================ slash commands
 def fmt_uptime(seconds: float) -> str:
     seconds = int(seconds)
@@ -1639,41 +2407,74 @@ async def ping(interaction: discord.Interaction):
         accent=GREEN), ephemeral=True)
 
 
-@bot.tree.command(name="ping-roblox", description="Check the Roblox connection and the bot's cookie.")
+@bot.tree.command(name="ping-roblox", description="Check the Roblox connection.")
 async def ping_roblox(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     t = time.perf_counter()
     user = await bot.roblox.user_by_name("Roblox")
     api = f"Online ({round((time.perf_counter() - t) * 1000)} ms)" if user else "Unreachable"
-    cookie = "Not set"
-    if ROBLOX_COOKIE:
-        try:
-            async with bot.session.get(
-                "https://users.roblox.com/v1/users/authenticated",
-                headers={"Cookie": f".ROBLOSECURITY={ROBLOX_COOKIE}"},
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as r:
-                if r.status == 200:
-                    data = await r.json(content_type=None)
-                    cookie = f"Valid ({data.get('name', 'unknown')})"
-                else:
-                    cookie = f"Rejected (HTTP {r.status})"
-        except Exception:
-            cookie = "Check failed"
     await interaction.followup.send(view=build_card(
         "Roblox Status",
-        [[field("Roblox API", api), field("Bot Cookie", cookie)],
-         ["> The cookie is used by the Join button to find a player's live server."]],
-        accent=GREEN if user and cookie.startswith("Valid") else RED), ephemeral=True)
+        [[field("Roblox API", api)],
+         ["> Used to look up usernames and avatars. Server links are now pasted by the player when requesting."]],
+        accent=GREEN if user else RED), ephemeral=True)
 
 
-@bot.tree.command(name="panel", description="Owner only: repost the Rivalz panel.")
+@bot.tree.command(name="panel", description="Owner only: repost the Rivalz panel in this server.")
+@app_commands.guild_only()
 async def panel(interaction: discord.Interaction):
     if interaction.user.id != OWNER_ID:
         return await interaction.response.send_message("Owner only.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
-    await post_panel()
-    await interaction.followup.send("Panel reposted.", ephemeral=True)
+    ok = await post_panel(interaction.guild)
+    await interaction.followup.send("Panel reposted." if ok else "Could not post the panel. Run /build first.", ephemeral=True)
+
+
+@bot.tree.command(name="authorize", description="Owner only: authorize Rivalz to be used in this server.")
+@app_commands.guild_only()
+async def authorize(interaction: discord.Interaction):
+    if interaction.user.id != OWNER_ID:
+        return await interaction.response.send_message("Owner only.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    cfg = gcfg(interaction.guild.id)
+    was = cfg["authorized"]
+    cfg["authorized"] = True
+    cfg["authorized_by"], cfg["authorized_at"] = interaction.user.id, int(time.time())
+    store.save()
+    await ensure_readme(interaction.guild)
+    built = bool(cfg["ch"].get("panel"))
+    lines = ["> Rivalz is now authorized in this server." if not was else "> This server was already authorized."]
+    lines.append("> Everything is set up. Use `/build` any time to repair missing channels." if built
+                 else "> Next, run `/build` to create the categories and channels.")
+    await interaction.followup.send(view=build_card("Server Authorized", [lines], accent=GREEN), ephemeral=True)
+
+
+@bot.tree.command(name="build", description="Owner only: create the Rivalz categories and channels (run /authorize first).")
+@app_commands.guild_only()
+async def build(interaction: discord.Interaction):
+    if interaction.user.id != OWNER_ID:
+        return await interaction.response.send_message("Owner only.", ephemeral=True)
+    guild = interaction.guild
+    if not is_authorized(guild.id):
+        return await notice(interaction, "Not Authorized", "> Run `/authorize` in this server first, then `/build`.", accent=GREY)
+    await interaction.response.defer(ephemeral=True)
+    if not guild.me.guild_permissions.manage_channels:
+        return await notice(interaction, "Missing Permission", "> Rivalz needs **Manage Channels** to build the channels.")
+    try:
+        created, kept = await build_guild(guild)
+    except discord.HTTPException as exc:
+        print(f"Build failed: {exc!r}")
+        return await notice(interaction, "Build Failed",
+                            "> Discord refused one of the channels. Check that Rivalz has **Manage Channels** and **Manage Roles**, then run `/build` again.")
+    await ensure_readme(guild)
+    await post_panel(guild)
+    await refresh_leaderboards(guild, repost=True)
+    sections = [["> Rivalz is built and running in this server."]]
+    if created:
+        sections.append(["**Created**"] + [f"> {x}" for x in created])
+    if kept:
+        sections.append(["**Already there**"] + [f"> {x}" for x in kept])
+    await interaction.followup.send(view=build_card("Build Complete", sections, accent=GREEN), ephemeral=True)
 
 
 @bot.tree.error
