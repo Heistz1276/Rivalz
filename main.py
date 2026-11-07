@@ -1870,67 +1870,82 @@ def _medal(draw, cx, cy, colour, r=24):
     draw.polygon(inner, fill=tuple(max(0, c - 70) for c in colour))
 
 
+LB_OUT_W = 400  # finished picture width in pixels; fits a narrow Discord window
+
+
+def _shrink(im):
+    from PIL import Image
+    return im.resize((LB_OUT_W, max(1, round(im.height * LB_OUT_W / im.width))), Image.LANCZOS)
+
+
 def render_podium(mode_name, period_label, podium, avatars):
-    """Title + the top 3 with their profile pictures (compact). podium: list of dicts (rank, uid, name, w, l)."""
+    """Title + the top 3 with their profile pictures. podium: list of dicts (rank, uid, name, w, l)."""
     from PIL import Image, ImageDraw, ImageFilter
-    H = 330
+    H = 560
     im = Image.new("RGBA", (LB_W, H), (0, 0, 0, 0))
     d = ImageDraw.Draw(im, "RGBA")
-    d.rounded_rectangle((20, 6, LB_W - 20, H - 6), radius=26, fill=C_CARD + (255,), outline=C_CARD_LINE, width=3)
-    d.text((LB_W / 2, 36), "Leaderboard", font=lb_font("bold", 32), fill=C_TEXT, anchor="mm")
-    d.text((LB_W / 2, 66), f"{mode_name}  |  {period_label}", font=lb_font("medium", 20), fill=C_CYAN, anchor="mm")
-    top, bottom = 86, H - 18
-    d.rounded_rectangle((42, top, LB_W - 42, bottom), radius=22, fill=C_PANEL, outline=(34, 150, 170), width=2)
-    slots = {1: (500, 188, 92, C_GOLD), 2: (240, 196, 72, C_SILVER), 3: (760, 196, 72, C_BRONZE)}
+    d.rounded_rectangle((20, 8, LB_W - 20, H - 8), radius=34, fill=C_CARD + (255,), outline=C_CARD_LINE, width=3)
+    d.text((LB_W / 2, 52), "Leaderboard", font=lb_font("bold", 46), fill=C_TEXT, anchor="mm")
+    d.text((LB_W / 2, 100), f"{mode_name}  |  {period_label}", font=lb_font("medium", 27), fill=C_CYAN, anchor="mm")
+    top, bottom = 130, H - 20
+    d.rounded_rectangle((42, top, LB_W - 42, bottom), radius=30, fill=C_PANEL, outline=(34, 150, 170), width=2)
+    slots = {1: (500, 300, 190, C_GOLD), 2: (240, 312, 140, C_SILVER), 3: (760, 312, 140, C_BRONZE)}
     by_rank = {e["rank"]: e for e in podium}
     for rank, (cx, cy, size, colour) in slots.items():
         e = by_rank.get(rank)
         y0 = cy - size // 2
-        d.rounded_rectangle((cx - size // 2 - 4, y0 - 4, cx + size // 2 + 4, y0 + size + 4),
-                            radius=int(size * 0.2) + 4, fill=colour if e else (60, 80, 90))
+        glow = Image.new("RGBA", (size + 80, size + 80), (0, 0, 0, 0))
+        ImageDraw.Draw(glow).rounded_rectangle((40, 40, size + 40, size + 40), radius=34, fill=colour + (70,))
+        glow = glow.filter(ImageFilter.GaussianBlur(14))
+        im.alpha_composite(glow, (cx - size // 2 - 40, y0 - 40))
+        d = ImageDraw.Draw(im, "RGBA")
+        border = 6 if rank == 1 else 5
+        d.rounded_rectangle((cx - size // 2 - border, y0 - border, cx + size // 2 + border, y0 + size + border),
+                            radius=int(size * 0.2) + border, fill=colour if e else (60, 80, 90))
         av = _rounded_avatar(avatars.get(e["uid"]) if e else None, size, int(size * 0.2), (e or {}).get("name", "?"),
                              tint={1: (14, 130, 160), 2: (50, 90, 150), 3: (170, 110, 40)}[rank])
         im.alpha_composite(av, (cx - size // 2, y0))
         d = ImageDraw.Draw(im, "RGBA")
         if rank == 1:
-            _crown(d, cx, y0 - 3, w=64, h=32)
+            _crown(d, cx, y0 - 6, w=110, h=56)
         else:
-            _medal(d, cx, y0 - 14, colour, r=13)
-        ny = y0 + size + 18
+            _medal(d, cx, y0 - 26, colour, r=22)
+        ny = y0 + size + 24
         if e:
-            f, txt = _fit_text(d, f"@{e['name']}", "medium", 22 if rank == 1 else 20, 230)
+            f, txt = _fit_text(d, f"@{e['name']}", "medium", 29 if rank == 1 else 26, 260)
             d.text((cx, ny), txt, font=f, fill=colour, anchor="mm")
-            d.text((cx, ny + 26), f"{e['w']} Wins  |  W {e['w']}  L {e['l']}", font=lb_font("bold", 20 if rank == 1 else 18),
-                   fill=colour, anchor="mm")
+            d.text((cx, ny + 36), f"{e['w']} Wins", font=lb_font("bold", 34 if rank == 1 else 30), fill=colour, anchor="mm")
+            d.text((cx, ny + 70), f"W {e['w']}   L {e['l']}", font=lb_font("regular", 22), fill=C_MUTED, anchor="mm")
         else:
-            d.text((cx, ny + 4), "No one yet", font=lb_font("medium", 18), fill=C_MUTED, anchor="mm")
+            d.text((cx, ny + 10), "No one yet", font=lb_font("medium", 24), fill=C_MUTED, anchor="mm")
+    d.text((LB_W / 2, bottom - 20), f"Ranked by wins  |  {mode_name}", font=lb_font("regular", 21), fill=C_MUTED, anchor="mm")
     out = io.BytesIO()
-    im.save(out, "PNG")
+    _shrink(im).save(out, "PNG")
     return out.getvalue()
 
 
 def render_list(entries, avatars):
-    """Compact rows, one line each. entries: dicts (rank, uid, name, w, l)."""
+    """Rows like the mock-up (rank, picture, name over W/L, wins). entries: dicts (rank, uid, name, w, l)."""
     from PIL import Image, ImageDraw
-    row_h, gap = 46, 6
-    H = 16 + len(entries) * (row_h + gap) + 8
+    row_h, gap = 84, 9
+    H = 26 + len(entries) * (row_h + gap) + 18
     im = Image.new("RGBA", (LB_W, H), (0, 0, 0, 0))
     d = ImageDraw.Draw(im, "RGBA")
-    d.rounded_rectangle((20, 0, LB_W - 20, H - 3), radius=26, fill=C_CARD + (255,), outline=C_CARD_LINE, width=3)
-    y = 14
+    d.rounded_rectangle((20, 0, LB_W - 20, H - 4), radius=34, fill=C_CARD + (255,), outline=C_CARD_LINE, width=3)
+    y = 22
     for e in entries:
-        d.rounded_rectangle((44, y, LB_W - 44, y + row_h), radius=16, fill=C_ROW, outline=C_ROW_LINE, width=2)
-        d.text((88, y + row_h / 2), str(e["rank"]), font=lb_font("bold", 22), fill=C_TEXT, anchor="mm")
-        av = _rounded_avatar(avatars.get(e["uid"]), 34, 9, e.get("name", "?"))
-        im.alpha_composite(av, (122, y + 6))
+        d.rounded_rectangle((50, y, LB_W - 50, y + row_h), radius=24, fill=C_ROW, outline=C_ROW_LINE, width=2)
+        d.text((100, y + row_h / 2), str(e["rank"]), font=lb_font("bold", 32), fill=C_TEXT, anchor="mm")
+        av = _rounded_avatar(avatars.get(e["uid"]), 62, 14, e.get("name", "?"))
+        im.alpha_composite(av, (146, y + 11))
         d = ImageDraw.Draw(im, "RGBA")
-        f, txt = _fit_text(d, f"@{e['name']}", "medium", 22, 430)
-        d.text((170, y + row_h / 2), txt, font=f, fill=C_TEXT, anchor="lm")
-        d.text((640, y + row_h / 2), f"W {e['w']}  L {e['l']}", font=lb_font("regular", 17), fill=C_MUTED, anchor="lm")
-        d.text((LB_W - 76, y + row_h / 2), f"{e['w']} Wins", font=lb_font("bold", 22), fill=C_CYAN, anchor="rm")
+        f, txt = _fit_text(d, f"@{e['name']}", "medium", 28, 520)
+        d.text((226, y + 29), txt, font=f, fill=C_TEXT, anchor="lm")
+        d.text((226, y + 61), f"W {e['w']}  L {e['l']}", font=lb_font("regular", 21), fill=C_MUTED, anchor="lm")
+        d.text((LB_W - 90, y + row_h / 2), f"{e['w']} Wins", font=lb_font("bold", 30), fill=C_CYAN, anchor="rm")
         y += row_h + gap
     out = io.BytesIO()
-    im.save(out, "PNG")
+    _shrink(im).save(out, "PNG")
     return out.getvalue()
 
 
@@ -2285,8 +2300,12 @@ async def send_my_rank(interaction: discord.Interaction, mode: str, period: str)
         f"My Rank ({m['name']} | {LB_PERIODS[period]})", sections, accent=m["colour"]), ephemeral=True)
 
 
+LB_SIG = {}  # what each channel's board last showed, so an unchanged board is not reposted every 5 minutes
+
+
 async def refresh_leaderboards(guild, repost=False):
-    """Draw the Duel and Spar boards into their channels (edits the one message the bot keeps there)."""
+    """Posts a fresh Duel and Spar board in their channels and removes the previous one. A board that has not
+    changed since it was last posted is left alone (so there is no pointless delete + repost)."""
     cfg = gcfg(guild.id)
     for mode in LB_MODES:
         cid = cfg["ch"].get(f"{mode}_lb")
@@ -2294,44 +2313,37 @@ async def refresh_leaderboards(guild, repost=False):
         if not chan:
             continue
         period = cfg["lb_period"].get(mode, "day")
+        sig = (period, tuple(standings(mode, period)))
+        if not repost and LB_SIG.get((guild.id, mode)) == sig:
+            continue
         try:
             view, files = await board_message(guild, mode, period)
         except Exception as exc:
             print(f"Could not draw the {mode} leaderboard: {exc!r}")
             continue
-        msg_id = cfg["lb_msg"].get(mode)
-        if repost:
-            try:
-                async for message in chan.history(limit=30):
-                    if message.author.id == bot.user.id:
-                        try:
-                            await message.delete()
-                        except discord.HTTPException:
-                            pass
-            except discord.HTTPException:
-                pass
-            msg_id = None
-        if msg_id:
-            try:
-                await chan.get_partial_message(msg_id).edit(view=view, attachments=files)
-                continue
-            except discord.HTTPException as exc:  # gone, or an older style message that can not be edited
-                print(f"Replacing the {mode} leaderboard message ({exc!r}).")
-                try:
-                    await chan.get_partial_message(msg_id).delete()
-                except discord.HTTPException:
-                    pass
-                try:
-                    view, files = await board_message(guild, mode, period)  # files were used up by the failed edit
-                except Exception as exc2:
-                    print(f"Could not draw the {mode} leaderboard: {exc2!r}")
-                    continue
         try:
             msg = await chan.send(view=view, files=files)
-            cfg["lb_msg"][mode] = msg.id
-            store.save()
         except discord.HTTPException as exc:
             print(f"Could not post the {mode} leaderboard (needs View Channel, Send Messages, Attach Files): {exc!r}")
+            continue
+        LB_SIG[(guild.id, mode)] = sig
+        old_id = cfg["lb_msg"].get(mode)
+        cfg["lb_msg"][mode] = msg.id
+        store.save()
+        try:  # remove the previous leaderboard(s) once the new one is up
+            async for message in chan.history(limit=30):
+                if message.author.id == bot.user.id and message.id != msg.id:
+                    try:
+                        await message.delete()
+                    except discord.HTTPException:
+                        pass
+        except discord.HTTPException:
+            pass
+        if old_id and old_id != msg.id:
+            try:
+                await chan.get_partial_message(old_id).delete()
+            except discord.HTTPException:
+                pass
 
 
 LB_TASKS = {}
