@@ -9,6 +9,8 @@ import io
 import json
 import math
 import shutil
+import sqlite3
+import tempfile
 import os
 import re
 import subprocess
@@ -112,14 +114,62 @@ STATUS_TEXT = {"open": "Open", "ended": "Ended", "finished": "Recorded"}
 
 
 # ============================================================ storage
+DB_FILE = os.path.join(DATA_DIR, "rivalz.sqlite3")
+
+
+def open_db():
+    db = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=30)
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA synchronous=FULL")
+    db.execute("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    db.execute("""CREATE TABLE IF NOT EXISTS matches (
+        g INTEGER NOT NULL, m TEXT NOT NULL, n INTEGER NOT NULL, ts INTEGER NOT NULL,
+        w INTEGER NOT NULL, l INTEGER NOT NULL, ws INTEGER, ls INTEGER, PRIMARY KEY (g, m, n))""")
+    db.commit()
+    return db
+
+
+DB = open_db()
+
+
+def daily_backup():
+    """One consistent copy of the whole database per day in DATA_DIR/backups (the last 14 are kept)."""
+    try:
+        folder = os.path.join(DATA_DIR, "backups")
+        os.makedirs(folder, exist_ok=True)
+        dest = os.path.join(folder, datetime.now(timezone.utc).strftime("rivalz_%Y-%m-%d.sqlite3"))
+        if os.path.exists(dest):
+            return
+        out = sqlite3.connect(dest)
+        try:
+            DB.backup(out)
+        finally:
+            out.close()
+        for old in sorted(os.listdir(folder))[:-14]:
+            os.remove(os.path.join(folder, old))
+    except Exception as exc:
+        print(f"Daily backup failed: {exc!r}")
+
+
 class Store:
+    """Everything except the leaderboard matches. Same store.d dict as before, saved into SQLite (table kv),
+    one row per top-level key. An old rivalz_data.json is imported once when the database is new."""
     def __init__(self, path: str):
-        self.path = path
+        self.legacy = path
         self.d = {}
-        if os.path.exists(path):
+        self._saved = {}
+        rows = DB.execute("SELECT key, value FROM kv WHERE key != 'lb_meta'").fetchall()
+        for k, v in rows:
+            try:
+                self.d[k] = json.loads(v)
+                self._saved[k] = v
+            except Exception as exc:
+                print(f"Could not read saved data '{k}': {exc}")
+        if not rows and os.path.exists(path):
             try:
                 with open(path, "r", encoding="utf-8") as fh:
                     self.d = json.load(fh)
+                print(f"Imported {path} into the SQLite database.")
             except Exception as exc:
                 print(f"Could not read {path}, starting fresh: {exc}")
                 self.d = {}
@@ -129,12 +179,16 @@ class Store:
         for key in ("challenges", "profiles", "tickets", "archive", "guilds"):
             self.d.setdefault(key, {})
         self.d.setdefault("matches", [])
+        self.save()
 
     def save(self):
-        tmp = self.path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(self.d, fh, indent=2)
-        os.replace(tmp, self.path)
+        with DB:  # one transaction: all or nothing
+            for k, val in self.d.items():
+                txt = json.dumps(val, separators=(",", ":"))
+                if self._saved.get(k) != txt:
+                    DB.execute("INSERT INTO kv (key, value) VALUES (?, ?) "
+                               "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (k, txt))
+                    self._saved[k] = txt
 
 
 store = Store(DATA_FILE)
@@ -1951,48 +2005,59 @@ def render_list(entries, avatars):
 
 # ============================================================ leaderboard storage (its own file, with a backup copy)
 class LbStore:
-    """Every decided match lives here, apart from the ticket data, so ticket clean-ups can never touch it.
-    Saved atomically (temp file + fsync), with a .bak copy and one snapshot per day (last 14 kept)."""
-    def __init__(self, path: str):
-        self.path = path
-        self.d = {"version": 1, "matches": [], "backfilled": False}
-        for p in (path, path + ".bak"):
-            if os.path.exists(p):
-                try:
-                    with open(p, "r", encoding="utf-8") as fh:
-                        loaded = json.load(fh)
-                    if isinstance(loaded, dict) and isinstance(loaded.get("matches"), list):
-                        self.d.update(loaded)
-                        break
-                except Exception as exc:
-                    print(f"Could not read {p}: {exc}")
-        self.d.setdefault("matches", [])
+    """Every decided match is a row in the SQLite table `matches` (one row per ticket), apart from the ticket data,
+    so ticket clean-ups can never touch it. self.d["matches"] is the in-memory copy; save() writes only what changed."""
+    def __init__(self, legacy_json: str):
+        self.legacy = legacy_json
+        self.d = {"matches": [], "backfilled": False}
+        self._keys = set()
+        for g, m, n, ts, w, l, ws, ls in DB.execute("SELECT g, m, n, ts, w, l, ws, ls FROM matches"):
+            self.d["matches"].append({"g": g, "m": m, "n": n, "ts": ts, "w": w, "l": l, "ws": ws, "ls": ls})
+            self._keys.add((g, m, n))
+        meta = DB.execute("SELECT value FROM kv WHERE key = 'lb_meta'").fetchone()
+        if meta:
+            try:
+                self.d["backfilled"] = bool(json.loads(meta[0]).get("backfilled"))
+            except Exception:
+                pass
+        if not self.d["matches"]:
+            self._import_json()
+
+    def _import_json(self):
+        """New database: pull in an older leaderboard_data.json (or its .bak / snapshots) once."""
+        folder = os.path.join(os.path.dirname(self.legacy), "lb_snapshots")
+        snaps = sorted((os.path.join(folder, f) for f in os.listdir(folder)), reverse=True) if os.path.isdir(folder) else []
+        for cand in [self.legacy, self.legacy + ".bak"] + snaps:
+            try:
+                with open(cand, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                if isinstance(data.get("matches"), list) and data["matches"]:
+                    self.d["matches"] = data["matches"]
+                    self.d["backfilled"] = bool(data.get("backfilled"))
+                    self.save()
+                    print(f"Leaderboard: imported {len(self.d['matches'])} matches from {cand} into SQLite.")
+                    return
+            except Exception:
+                continue
 
     def save(self):
-        tmp = self.path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(self.d, fh)
-            fh.flush()
-            os.fsync(fh.fileno())
-        if os.path.exists(self.path):
+        cur = {}
+        for x in self.d["matches"]:
             try:
-                shutil.copyfile(self.path, self.path + ".bak")
-            except OSError:
-                pass
-        os.replace(tmp, self.path)
-        self._snapshot()
-
-    def _snapshot(self):
-        try:
-            folder = os.path.join(os.path.dirname(self.path), "lb_snapshots")
-            os.makedirs(folder, exist_ok=True)
-            snap = os.path.join(folder, datetime.now(timezone.utc).strftime("leaderboard_%Y-%m-%d.json"))
-            if not os.path.exists(snap):
-                shutil.copyfile(self.path, snap)
-                for old in sorted(os.listdir(folder))[:-14]:
-                    os.remove(os.path.join(folder, old))
-        except OSError:
-            pass
+                row = (int(x["g"]), str(x["m"]), int(x["n"]), int(x["ts"]), int(x["w"]), int(x["l"]),
+                       int(x.get("ws") or 0), int(x.get("ls") or 0))
+            except Exception:
+                continue
+            cur[(row[0], row[1], row[2])] = row
+        gone = [k for k in self._keys if k not in cur]
+        new = [cur[k] for k in cur if k not in self._keys]
+        with DB:  # one transaction: all or nothing
+            DB.executemany("DELETE FROM matches WHERE g = ? AND m = ? AND n = ?", gone)
+            DB.executemany("INSERT OR REPLACE INTO matches (g, m, n, ts, w, l, ws, ls) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", new)
+            DB.execute("INSERT INTO kv (key, value) VALUES ('lb_meta', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                       (json.dumps({"backfilled": bool(self.d.get("backfilled"))}),))
+        self._keys = set(cur)
+        daily_backup()
 
 
 lbstore = LbStore(os.path.join(DATA_DIR, "leaderboard_data.json"))
@@ -2064,26 +2129,12 @@ def backfill_matches():
 
 
 def recover_matches():
-    """If the leaderboard file came up empty, try its backup copy, then the daily snapshots, then rebuild
-    from the saved tickets/archive (backfill). Always prints how many matches are loaded and from where."""
+    """Prints how many matches the database holds. If it is empty, rebuilds from saved tickets/archive (backfill)."""
     if lbstore.d["matches"]:
-        print(f"Leaderboard: {len(lbstore.d['matches'])} matches loaded from {lbstore.path}")
+        print(f"Leaderboard: {len(lbstore.d['matches'])} matches loaded from {DB_FILE}")
         return
-    folder = os.path.join(os.path.dirname(lbstore.path), "lb_snapshots")
-    snaps = sorted((os.path.join(folder, f) for f in os.listdir(folder)), reverse=True) if os.path.isdir(folder) else []
-    for cand in [lbstore.path + ".bak"] + snaps:
-        try:
-            with open(cand, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-            if isinstance(data.get("matches"), list) and data["matches"]:
-                lbstore.d["matches"] = data["matches"]
-                lbstore.save()
-                print(f"Leaderboard: restored {len(data['matches'])} matches from {cand}")
-                return
-        except Exception:
-            continue
-    lbstore.d["backfilled"] = False  # nothing to restore: rebuild from tickets/archive below
-    print(f"Leaderboard: no saved matches found in {lbstore.path} (rebuilding from tickets if any).")
+    lbstore.d["backfilled"] = False
+    print(f"Leaderboard: no saved matches in {DB_FILE} (rebuilding from tickets if any).")
 
 
 def standings(mode, period):
@@ -2535,11 +2586,31 @@ async def restoreboard(interaction: discord.Interaction, file: discord.Attachmen
     await interaction.response.defer(ephemeral=True)
     if file.size > 25 * 1024 * 1024:
         return await notice(interaction, "File Too Big", "> That file is too large.")
-    try:
-        data = json.loads((await file.read()).decode("utf-8"))
-        assert isinstance(data, dict)
-    except Exception:
-        return await notice(interaction, "Not A Data File", "> That is not a valid JSON data file.")
+    raw = await file.read()
+    data = {}
+    if raw.startswith(b"SQLite format 3\x00"):  # a database backup (from /backup or the backups folder)
+        tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False) as fh:
+                fh.write(raw)
+                tmp = fh.name
+            src_db = sqlite3.connect(tmp)
+            try:
+                cols = ("g", "m", "n", "ts", "w", "l", "ws", "ls")
+                data["matches"] = [dict(zip(cols, r)) for r in src_db.execute("SELECT g, m, n, ts, w, l, ws, ls FROM matches")]
+            finally:
+                src_db.close()
+        except Exception:
+            return await notice(interaction, "Not A Data File", "> That is not a valid Rivalz database file.")
+        finally:
+            if tmp and os.path.exists(tmp):
+                os.remove(tmp)
+    else:
+        try:
+            data = json.loads(raw.decode("utf-8"))
+            assert isinstance(data, dict)
+        except Exception:
+            return await notice(interaction, "Not A Data File", "> That is not a valid JSON or database file.")
     rows = [r for r in data.get("matches", []) if isinstance(r, dict)]
     sources = [(a, a.get("created", 0)) for a in (data.get("archive") or {}).values() if isinstance(a, dict)]
     sources += [(t, t.get("ended_at") or t.get("created", 0)) for t in (data.get("tickets") or {}).values()
@@ -2569,6 +2640,33 @@ async def restoreboard(interaction: discord.Interaction, file: discord.Attachmen
     await notice(interaction, "Leaderboard Restored",
                  [f"> Added **{added}** matches ({len(lbstore.d['matches'])} saved in total).",
                   "> The boards refresh in a few seconds."], accent=GREEN)
+
+
+@bot.tree.command(name="backup", description="Owner only: download a copy of the Rivalz database.")
+async def backup_cmd(interaction: discord.Interaction):
+    if interaction.user.id != OWNER_ID:
+        return await interaction.response.send_message("Owner only.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False) as fh:
+            tmp = fh.name
+        out = sqlite3.connect(tmp)
+        try:
+            DB.backup(out)
+        finally:
+            out.close()
+        with open(tmp, "rb") as fh:
+            blob = fh.read()
+        await interaction.followup.send(
+            f"Backup: {len(lbstore.d['matches'])} matches. Keep this file safe; `/restoreboard` can load it back.",
+            file=discord.File(io.BytesIO(blob), filename="rivalz.sqlite3"), ephemeral=True)
+    except Exception as exc:
+        print(f"Backup failed: {exc!r}")
+        await notice(interaction, "Backup Failed", "> Could not make or send the backup (it may be too large for Discord).")
+    finally:
+        if tmp and os.path.exists(tmp):
+            os.remove(tmp)
 
 
 @bot.tree.command(name="addmatch", description="Owner only: add one past result to the global leaderboard.")
