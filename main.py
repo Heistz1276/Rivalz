@@ -1459,8 +1459,22 @@ async def ensure_ticket_access(guild, t):
 
 async def refresh_guild_cards(guild):
     """Fresh leaderboards plus every ticket card and live card brought up to date. Used by /update and on a new version."""
-    await post_panel(guild)
-    tickets, cards = await refresh_guild_cards(guild)
+    tickets = cards = 0
+    for t in list(store.d["tickets"].values()):
+        if t.get("guild_id") != guild.id:
+            continue
+        tickets += 1
+        await refresh_ticket(t)
+        if t.get("status") != "finished":
+            await ensure_ticket_access(guild, t)
+        if t.get("status") == "open":
+            if t.get("ongoing_msg"):
+                await update_ongoing(t)
+            else:
+                await post_ongoing(t)
+                cards += 1
+        await asyncio.sleep(0.3)
+    await refresh_leaderboards(guild, repost=True)
     return tickets, cards
 
 
