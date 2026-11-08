@@ -2675,6 +2675,8 @@ class Rivalz(commands.Bot):
         self._ready_once = True
         updated = store.d.get("code_hash") != CODE_HASH   # a new main.py was uploaded
         print(f"Data folder: {DATA_DIR} | version {CODE_HASH}{' (new version)' if updated else ''}")
+        store.d["code_hash"] = CODE_HASH   # remembered right away, so a crash and restart is not treated as a new version
+        store.save()
         migrate_legacy()
         recover_matches()
         backfill_matches()
@@ -2682,7 +2684,7 @@ class Rivalz(commands.Bot):
             gcfg(guild.id)
             adopt_legacy_extras(guild)
             if is_authorized(guild.id) and gcfg(guild.id)["ch"].get("panel"):
-                await post_panel(guild)
+                await post_panel(guild, force=updated)
         if not lbstore.d["matches"] and not lbstore.d.get("reset_id"):  # nothing saved: rebuild from the result cards
             for guild in self.guilds:
                 rid = gcfg(guild.id)["ch"].get("results") or (LEGACY["results"] if guild.get_channel(LEGACY["results"]) else None)
@@ -2739,13 +2741,22 @@ class Rivalz(commands.Bot):
 bot = Rivalz()
 
 
-async def post_panel(guild) -> bool:
+async def post_panel(guild, force=True) -> bool:
+    """force=False (a plain restart): the panel is left alone when it is already up to date."""
     channel_id = cfg_channel_id(guild.id, "panel")
     if not channel_id:
         print(f"{guild.name}: no panel channel yet (run /build).")
         return False
     try:
         channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+        pcfg = gcfg(guild.id)
+        if not force and pcfg.get("panel_ver") == CODE_HASH and pcfg.get("panel_msg"):
+            try:
+                await channel.fetch_message(pcfg["panel_msg"])
+                print(f"Panel in {guild.name} is already up to date, left alone.")
+                return True
+            except discord.HTTPException:
+                pass  # it is gone: post it again below
         try:
             async for message in channel.history(limit=50):
                 if message.author.id == bot.user.id:
@@ -2756,10 +2767,12 @@ async def post_panel(guild) -> bool:
         except discord.Forbidden:
             print("Missing Read Message History in the panel channel; old panels were not removed.")
         if GIF_PATH and os.path.exists(GIF_PATH):
-            await channel.send(view=PanelView(), file=discord.File(GIF_PATH, filename="panel.gif"))
+            sent = await channel.send(view=PanelView(), file=discord.File(GIF_PATH, filename="panel.gif"))
         else:
             print("panel.gif not found next to main.py (or in assets/), posting the panel without the banner.")
-            await channel.send(view=PanelView())
+            sent = await channel.send(view=PanelView())
+        pcfg["panel_msg"], pcfg["panel_ver"] = sent.id, CODE_HASH
+        store.save()
         print(f"Panel posted in {guild.name}.")
         return True
     except discord.Forbidden:
@@ -3459,8 +3472,16 @@ async def refresh_leaderboards(guild, repost=False):
         period = "all"  # a freshly posted board always starts on the global All-time view
         cfg["lb_period"][mode] = "all"
         sig = (period, tuple(standings(mode, period)))
+        skey = hashlib.sha1(repr(sig).encode()).hexdigest()[:16]
         if not repost and LB_SIG.get((guild.id, mode)) == sig:
             continue
+        if not repost and (guild.id, mode) not in LB_SIG and cfg.get("lb_sig", {}).get(mode) == skey and cfg["lb_msg"].get(mode):
+            try:  # a restart: the posted board still shows these standings, leave it alone
+                await chan.fetch_message(cfg["lb_msg"][mode])
+                LB_SIG[(guild.id, mode)] = sig
+                continue
+            except discord.HTTPException:
+                pass
         try:
             view, files = await board_message(guild, mode, period)
         except Exception as exc:
@@ -3472,6 +3493,7 @@ async def refresh_leaderboards(guild, repost=False):
             print(f"Could not post the {mode} leaderboard (needs View Channel, Send Messages, Attach Files): {exc!r}")
             continue
         LB_SIG[(guild.id, mode)] = sig
+        cfg.setdefault("lb_sig", {})[mode] = skey
         old_id = cfg["lb_msg"].get(mode)
         cfg["lb_msg"][mode] = msg.id
         store.save()
