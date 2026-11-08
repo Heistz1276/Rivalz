@@ -73,11 +73,15 @@ LEGACY = {
     "panel": 1568343031294459904, "log": 1568525004164042842, "results": 1568527659334377492,
     "duel_lb": 1568637988164862133, "spar_lb": 1568637960855879680,
     "cat_main": 1568343167437115423, "cat_tickets": 1568527718419664927,
+    "ongoing": 1568968016493027328, "ongoing_role": 1568968211083567195,
 }
 
 EXPIRY_MINUTES = env_int("CHALLENGE_EXPIRY_MINUTES", 30)
 MAX_ROUNDS = env_int("MAX_ROUNDS", 25)
 GANK_SECONDS = 120
+MAX_SPECTATORS = 3            # how many spectators one live match can have (the developer is not counted)
+SPECTATOR_CAN_CHAT = False    # False = spectators can see and read the ticket + join the voice channel, but not type/speak
+MSG_NOTICE_EVERY = 15         # the "Match Details" card is posted at 15 messages, again at 30 (old one removed), 45, ...
 LB_MODES = ("duel", "spar")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -240,7 +244,7 @@ def gcfg(gid) -> dict:
     """Saved setup for one server: authorized flag, channel ids, category ids, leaderboard message ids."""
     g = store.d["guilds"].setdefault(str(gid), {})
     g.setdefault("authorized", False)
-    for key in ("ch", "cat", "lb_msg", "lb_period"):
+    for key in ("ch", "cat", "lb_msg", "lb_period", "role"):
         g.setdefault(key, {})
     return g
 
@@ -348,7 +352,12 @@ def field(label: str, value) -> str:
 
 
 def rounds_text(n: int) -> str:
-    return f"{n} Round" if n == 1 else f"{n} Rounds"
+    return f"First to {n}"
+
+
+def max_total_rounds(n: int) -> int:
+    """First to N: the most rounds a match can last is 2N-1 (first to 5 -> 9 rounds)."""
+    return max(1, 2 * n - 1)
 
 
 def add_buttons(container, buttons):
@@ -402,9 +411,9 @@ async def notice(interaction: discord.Interaction, title: str, text, *, accent=R
 
 
 async def guard(interaction: discord.Interaction, gid=None) -> bool:
-    """True when this server is authorized. Otherwise replies and returns False."""
+    """True when this server is authorized. Otherwise replies and returns False. The developer always passes."""
     gid = gid or interaction.guild_id
-    if is_authorized(gid):
+    if interaction.user.id == OWNER_ID or is_authorized(gid):
         return True
     await notice(interaction, "Not Authorized",
                  "> Rivalz is not authorized in this server yet. The bot owner needs to run `/authorize`.", accent=GREY)
@@ -427,7 +436,14 @@ async def edit_dm(ch, view):
 
 
 # ============================================================ ticket state helpers
+def is_owner(user) -> bool:
+    """The developer (OWNER_ID) bypasses every restriction."""
+    return bool(OWNER_ID) and getattr(user, "id", None) == OWNER_ID
+
+
 def is_staff(user) -> bool:
+    if is_owner(user):
+        return True
     if isinstance(user, discord.Member):
         if user.guild_permissions.manage_channels:
             return True
@@ -550,6 +566,12 @@ def ticket_view(t, ping=False):
         info += f"\n> **Server:** `{server_label(t['server'])} set`"
     if t.get("vc_id"):
         info += f"\n> **Voice:** <#{t['vc_id']}>"
+    specs = t.get("spectators") or []
+    if specs:
+        info += f"\n> **Spectators:** `{spec_count(t)}/{MAX_SPECTATORS}`"
+        for s in specs[:12]:
+            who = f" (`@{esc(s['roblox_name'])}`)" if s.get("roblox_name") else ""
+            info += f"\n> - <@{s['discord_id']}>{who}"
     c.add_item(discord.ui.Separator())
     c.add_item(discord.ui.TextDisplay(info))
 
@@ -900,12 +922,14 @@ async def create_ticket(guild: discord.Guild, ch, number=None):
         "ended_at": None, "ended_by": None, "scored_at": None, "scored_by": None,
         "result_msg": None, "result_url": None,
         "gank_url": None, "gank_by": None, "gank_deadline": 0, "gank_msg": None,
+        "spectators": [], "ongoing_msg": None, "msgs": 0, "notice_msg": None,
     }
     msg = await channel.send(view=ticket_view(t, ping=True))
     t["message_id"] = msg.id
     store.d["tickets"][str(channel.id)] = t
     store.save()
     await log_opened(t)
+    await post_ongoing(t)  # Ongoing-Ping: live card with a Join as Spectator button
     return channel, t
 
 
@@ -1048,10 +1072,11 @@ async def submit_challenge(interaction: discord.Interaction, mode: str, rival, r
 
     pending = [c for c in store.d["challenges"].values()
                if c["status"] == "pending" and c["requester"] == interaction.user.id]
-    if any(c["opponent"] == rival.id and c["mode"] == mode for c in pending):
-        return await notice(interaction, "Request Failed", "> You already have a pending request to this rival.")
-    if len(pending) >= 3:
-        return await notice(interaction, "Request Failed", "> You have too many pending requests. Wait for a reply first.")
+    if not is_owner(interaction.user):  # developer bypass
+        if any(c["opponent"] == rival.id and c["mode"] == mode for c in pending):
+            return await notice(interaction, "Request Failed", "> You already have a pending request to this rival.")
+        if len(pending) >= 3:
+            return await notice(interaction, "Request Failed", "> You have too many pending requests. Wait for a reply first.")
 
     ch = {
         "id": uuid.uuid4().hex[:8], "mode": mode, "status": "pending", "guild_id": guild.id,
@@ -1094,15 +1119,16 @@ class ChallengeModal(discord.ui.Modal):
                                        component=self.opponent))
 
         self.rounds = discord.ui.Select(
-            placeholder="Select number of rounds",
+            placeholder="Select first to how many rounds",
             options=[
-                discord.SelectOption(label="1 Round", value="1", description="Single deciding round."),
-                discord.SelectOption(label="3 Rounds", value="3", description="Best of three."),
-                discord.SelectOption(label="5 Rounds", value="5", description="Best of five."),
+                discord.SelectOption(label="First to 1", value="1", description="Single deciding round."),
+                discord.SelectOption(label="First to 3", value="3", description="First to win 3 rounds (5 rounds at most)."),
+                discord.SelectOption(label="First to 5", value="5", description="First to win 5 rounds (9 rounds at most)."),
                 discord.SelectOption(label="Custom", value="custom", description="Type your own number next."),
             ],
         )
-        self.add_item(discord.ui.Label(text="Number of Rounds", component=self.rounds))
+        self.add_item(discord.ui.Label(text="First To", description="How many rounds a player must win first.",
+                                       component=self.rounds))
 
         self.server = discord.ui.TextInput(placeholder="Roseal / Roblox server link", min_length=10, max_length=400)
         self.add_item(discord.ui.Label(text="Server Link", description="Your server link. Your rival joins it from the ticket.",
@@ -1110,7 +1136,7 @@ class ChallengeModal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        if not is_authorized(interaction.guild_id):
+        if not is_authorized(interaction.guild_id) and not is_owner(interaction.user):
             return await notice(interaction, "Not Authorized", "> Rivalz is not authorized in this server yet.", accent=GREY)
         rival = self.opponent.values[0]
         choice = self.rounds.values[0] if self.rounds.values else None
@@ -1142,7 +1168,8 @@ class ChallengeModal(discord.ui.Modal):
         button.callback = open_rounds
         await interaction.followup.send(view=build_card(
             "Custom Rounds",
-            ["> Press **Enter Rounds** and type how many rounds you want.", f"> Allowed: `1` to `{MAX_ROUNDS}`."],
+            ["> Press **Enter Rounds** and type how many rounds a player must win first (**first to**).",
+             f"> Allowed: `1` to `{MAX_ROUNDS}`. A first to `N` match lasts `2N-1` rounds at most."],
             accent=MODES[mode]["colour"], buttons=[button], timeout=600), ephemeral=True)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
@@ -1155,13 +1182,13 @@ class CustomRoundsModal(discord.ui.Modal):
         super().__init__(title="Custom Rounds", timeout=600)
         self.mode, self.rival_id, self.server = mode, rival_id, server
         self.value = discord.ui.TextInput(placeholder=f"1 to {MAX_ROUNDS}", min_length=1, max_length=3)
-        self.add_item(discord.ui.Label(text="Number of Rounds", component=self.value))
+        self.add_item(discord.ui.Label(text="First To", description="Rounds a player must win first.", component=self.value))
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         raw = self.value.value.strip()
         if not raw.isdigit() or not (1 <= int(raw) <= MAX_ROUNDS):
-            return await notice(interaction, "Request Failed", f"> Rounds must be a number from `1` to `{MAX_ROUNDS}`.")
+            return await notice(interaction, "Request Failed", f"> First to must be a number from `1` to `{MAX_ROUNDS}`.")
         try:
             rival = await interaction.guild.fetch_member(self.rival_id)
         except discord.NotFound:
@@ -1171,6 +1198,331 @@ class CustomRoundsModal(discord.ui.Modal):
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         await safe_reply(interaction, "Something went wrong. Please try again.")
         print(f"CustomRoundsModal error: {error!r}")
+
+
+# ============================================================ Ongoing-Ping + spectators + match details card
+_SPEC_LOCK = None
+
+
+def spec_lock():
+    global _SPEC_LOCK
+    if _SPEC_LOCK is None:
+        _SPEC_LOCK = asyncio.Lock()
+    return _SPEC_LOCK
+
+
+def spec_list(t) -> list:
+    return t.setdefault("spectators", [])
+
+
+def spec_count(t) -> int:
+    """Spectators that use up a slot (the developer never does)."""
+    return sum(1 for s in spec_list(t) if not s.get("dev"))
+
+
+def ongoing_view(t, role_id=None):
+    m = MODES[t["mode"]]
+    p0, p1 = t["p"]
+    view = discord.ui.LayoutView(timeout=None)
+    if role_id:
+        view.add_item(discord.ui.TextDisplay(f"<@&{role_id}>"))
+    c = discord.ui.Container(accent_colour=m["colour"])
+    c.add_item(discord.ui.TextDisplay(f"## Ongoing {m['name']} #{t['number']:03d}"))
+    c.add_item(discord.ui.Separator())
+    c.add_item(discord.ui.TextDisplay(f"> A **{m['name']}** is live right now. Join as a spectator to watch it."))
+    c.add_item(discord.ui.Separator())
+    c.add_item(discord.ui.TextDisplay("\n".join([
+        f"**Challenger:** <@{p0['discord_id']}> (`@{esc(p0['roblox_name'])}`)",
+        f"**Rival:** <@{p1['discord_id']}> (`@{esc(p1['roblox_name'])}`)",
+        field("Mode", m["name"]),
+        field("Rounds", rounds_text(t["rounds"])),
+        field("Server", server_label(t.get("server"))),
+        f"**Started:** <t:{int(t['created'])}:R>",
+        field("Spectators", f"{spec_count(t)}/{MAX_SPECTATORS}"),
+    ])))
+    specs = spec_list(t)
+    if specs:
+        c.add_item(discord.ui.Separator())
+        c.add_item(discord.ui.TextDisplay("**Spectating**\n" + "\n".join(f"> <@{s['discord_id']}>" for s in specs[:12])))
+    c.add_item(discord.ui.Separator())
+    c.add_item(discord.ui.TextDisplay("-# Rivalz | Ongoing"))
+    add_buttons(c, [SpectateButton(t["channel_id"])])
+    view.add_item(c)
+    return view
+
+
+async def post_ongoing(t):
+    """Send the live-match card to this server's ongoing channel, pinging only the Ongoing role."""
+    try:
+        cid = cfg_channel_id(t["guild_id"], "ongoing")
+        if not cid:
+            return
+        chan = await get_channel_safe(cid)
+        if not chan:
+            return
+        role_id = gcfg(t["guild_id"])["role"].get("ongoing")
+        mentions = discord.AllowedMentions(everyone=False, users=False,
+                                           roles=[discord.Object(id=role_id)] if role_id else False)
+        msg = await chan.send(view=ongoing_view(t, role_id), allowed_mentions=mentions)
+        t["ongoing_msg"] = msg.id
+        store.save()
+    except Exception as exc:
+        print(f"Could not post the ongoing ping: {exc!r}")
+
+
+async def update_ongoing(t):
+    mid = t.get("ongoing_msg")
+    cid = cfg_channel_id(t["guild_id"], "ongoing")
+    if not mid or not cid:
+        return
+    try:
+        chan = await get_channel_safe(cid)
+        if chan:
+            role_id = gcfg(t["guild_id"])["role"].get("ongoing")
+            await chan.get_partial_message(mid).edit(view=ongoing_view(t, role_id), allowed_mentions=NO_PING)
+    except discord.HTTPException as exc:
+        print(f"Could not update the ongoing ping: {exc!r}")
+
+
+async def clear_ongoing(t):
+    mid = t.get("ongoing_msg")
+    if not mid:
+        return
+    t["ongoing_msg"] = None
+    store.save()
+    cid = cfg_channel_id(t["guild_id"], "ongoing")
+    if not cid:
+        return
+    try:
+        chan = await get_channel_safe(cid)
+        if chan:
+            await chan.get_partial_message(mid).delete()
+    except discord.HTTPException:
+        pass
+
+
+async def grant_spectator(guild, t, member) -> bool:
+    """Let the spectator see (and read) the ticket and join its voice channel."""
+    channel = guild.get_channel(t["channel_id"])
+    if not channel:
+        return False
+    try:
+        await channel.set_permissions(
+            member, reason="Rivalz spectator",
+            overwrite=discord.PermissionOverwrite(view_channel=True, read_message_history=True,
+                                                  send_messages=SPECTATOR_CAN_CHAT, attach_files=False))
+    except discord.HTTPException as exc:
+        print(f"Could not give spectator access (the bot needs Manage Channels and Manage Roles): {exc!r}")
+        return False
+    vc = guild.get_channel(t["vc_id"]) if t.get("vc_id") else None
+    if vc:
+        try:
+            await vc.set_permissions(member, reason="Rivalz spectator",
+                                     overwrite=discord.PermissionOverwrite(view_channel=True, connect=True,
+                                                                           speak=SPECTATOR_CAN_CHAT))
+        except discord.HTTPException as exc:
+            print(f"Could not give spectator voice access: {exc!r}")
+    return True
+
+
+async def send_spectator_card(interaction, t, entry, already=False):
+    roseal, roblox = server_urls(t.get("server"))
+    m = MODES[t["mode"]]
+    buttons = [discord.ui.Button(label="Open Ticket", url=ticket_jump(t))]
+    if roseal:
+        buttons.append(discord.ui.Button(label="Open Roseal", url=roseal))
+    if roblox:
+        buttons.append(discord.ui.Button(label="Open Roblox Directly", url=roblox))
+    top = ["> You are already spectating this match." if already
+           else "> You are now a spectator. The ticket is open to you."]
+    if not SPECTATOR_CAN_CHAT:
+        top.append("> You can watch and read the ticket and join its voice channel. Only the fighters can type.")
+    info = [field("Match", f"{m['name']} #{t['number']:03d}")]
+    if entry.get("roblox_name"):
+        info.append(field("Roblox", entry["roblox_name"]))
+    info.append(field("Spectator Slot", "Developer (no limit)" if entry.get("dev")
+                      else f"{spec_count(t)}/{MAX_SPECTATORS}"))
+    if roblox:
+        how = ["> Tap **Open Roseal** first and pick how to launch Roblox, or use **Open Roblox Directly**."]
+        if not roseal:
+            how = ["> Tap **Open Roblox Directly** to launch Roblox. Roseal is not available for private server links."]
+    else:
+        how = ["> This ticket has no server link yet. Ask a fighter to send it in the ticket."]
+    view = build_card("Spectator Access", [top, info, how], accent=GREEN, buttons=buttons, timeout=600)
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(view=view, ephemeral=True)
+        else:
+            await interaction.response.send_message(view=view, ephemeral=True)
+    except discord.HTTPException:
+        pass
+
+
+async def add_spectator(interaction, t, rb):
+    """interaction must already be deferred (ephemeral). rb is the spectator's Roblox dict, or None (developer)."""
+    user, guild = interaction.user, interaction.guild
+    dev = is_owner(user)
+    if rb is None and dev:  # the developer does not have to give a username, but a saved one is used when there is one
+        prof = store.d["profiles"].get(str(user.id), {})
+        if prof.get("roblox_name"):
+            rb = {"id": prof.get("roblox_id"), "name": prof["roblox_name"], "display": prof.get("roblox_display")}
+    async with spec_lock():
+        t = store.d["tickets"].get(str(t["channel_id"]))
+        if not t or t["status"] != "open":
+            return await notice(interaction, "Match Ended", "> This match is no longer live.", accent=GREY)
+        have = next((s for s in spec_list(t) if s["discord_id"] == user.id), None)
+        if have:
+            return await send_spectator_card(interaction, t, have, already=True)
+        if not dev and spec_count(t) >= MAX_SPECTATORS:
+            return await notice(interaction, "Spectators Full",
+                                f"> This match already has `{MAX_SPECTATORS}/{MAX_SPECTATORS}` spectators.", accent=GREY)
+        entry = {"discord_id": user.id, "dev": dev, "joined": int(time.time())}
+        if rb:
+            entry.update(roblox_id=rb.get("id"), roblox_name=rb.get("name"), roblox_display=rb.get("display"))
+        spec_list(t).append(entry)
+        store.save()
+    ok = await grant_spectator(guild, t, user)
+    if not ok:
+        async with spec_lock():
+            spec_list(t)[:] = [s for s in spec_list(t) if s["discord_id"] != user.id]
+            store.save()
+        return await notice(interaction, "Could Not Add You",
+                            "> Rivalz could not open the ticket for you. Ask staff to check its **Manage Channels** and **Manage Roles** permissions.")
+    await refresh_ticket(t)
+    await update_ongoing(t)
+    try:
+        chan = guild.get_channel(t["channel_id"])
+        if chan:
+            who = f"<@{user.id}>" + (f" (`@{esc(entry['roblox_name'])}`)" if entry.get("roblox_name") else "")
+            await chan.send(view=build_card("Spectator Joined", [f"> {who} joined as a spectator."], accent=GREY),
+                            allowed_mentions=NO_PING)
+    except discord.HTTPException:
+        pass
+    await send_spectator_card(interaction, t, entry)
+
+
+class SpectatorModal(discord.ui.Modal):
+    def __init__(self, cid: int, prof: dict):
+        super().__init__(title="Join as Spectator", timeout=600)
+        self.cid = cid
+        self.username = discord.ui.TextInput(placeholder="Your Roblox username", default=(prof or {}).get("roblox_name") or None,
+                                             min_length=3, max_length=20)
+        self.add_item(discord.ui.Label(text="Roblox Username", description="Used so you can join the live server and watch.",
+                                       component=self.username))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        t = store.d["tickets"].get(str(self.cid))
+        if not t or t["status"] != "open":
+            return await notice(interaction, "Match Ended", "> This match is no longer live.", accent=GREY)
+        rb = await bot.roblox.user_by_name(self.username.value.strip())
+        if not rb:
+            return await notice(interaction, "Not Found", "> That Roblox username was not found. Press **Join as Spectator** and try again.")
+        prof = store.d["profiles"].setdefault(str(interaction.user.id), {})
+        if not prof.get("roblox_name"):  # first time: remember it so it is prefilled next time
+            prof.update({"roblox_id": rb["id"], "roblox_name": rb["name"], "roblox_display": rb["display"]})
+            store.save()
+        await add_spectator(interaction, t, rb)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        await safe_reply(interaction, "Something went wrong. Please try again.")
+        print(f"SpectatorModal error: {error!r}")
+
+
+class SpectateButton(discord.ui.DynamicItem[discord.ui.Button], template=r"rv:spec:(?P<cid>\d+)"):
+    """Join as Spectator, on the Ongoing-Ping card."""
+    def __init__(self, cid: int):
+        super().__init__(discord.ui.Button(label="Join as Spectator", style=discord.ButtonStyle.success,
+                                           custom_id=f"rv:spec:{cid}"))
+        self.cid = int(cid)
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        return cls(int(match["cid"]))
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        await safe_reply(interaction, "Something went wrong. Please try again.")
+        print(f"SpectateButton error: {error!r}")
+
+    async def callback(self, interaction: discord.Interaction):
+        t = store.d["tickets"].get(str(self.cid))
+        if not t or t["status"] != "open":
+            return await notice(interaction, "Match Ended", "> This match is no longer live.", accent=GREY)
+        if interaction.guild_id != t["guild_id"] or not await guard(interaction, t["guild_id"]):
+            return
+        user = interaction.user
+        if side_of(t, user.id) is not None:
+            return await notice(interaction, "You Are Fighting", "> You are one of the fighters in this match.", accent=GREY)
+        have = next((s for s in spec_list(t) if s["discord_id"] == user.id), None)
+        if have:
+            return await send_spectator_card(interaction, t, have, already=True)
+        if is_owner(user):  # developer bypass: no username, no slot limit
+            await interaction.response.defer(ephemeral=True)
+            return await add_spectator(interaction, t, None)
+        if spec_count(t) >= MAX_SPECTATORS:
+            return await notice(interaction, "Spectators Full",
+                                f"> This match already has `{MAX_SPECTATORS}/{MAX_SPECTATORS}` spectators.", accent=GREY)
+        await interaction.response.send_modal(SpectatorModal(self.cid, store.d["profiles"].get(str(user.id), {})))
+
+
+def match_notice_view(t):
+    """The small 'Match Details' card posted in the ticket at 15 messages, 30, 45 ..."""
+    m = MODES[t["mode"]]
+    jump = f"https://discord.com/channels/{t['guild_id']}/{t['channel_id']}/{t['message_id']}"
+    view = discord.ui.LayoutView(timeout=None)
+    c = discord.ui.Container(accent_colour=m["colour"])
+    c.add_item(discord.ui.TextDisplay(f"## [Match Details]({jump})"))
+    c.add_item(discord.ui.TextDisplay(
+        f"-# **Fair play = Better matches**, add your own score honestly under your name, then press **End** "
+        f"to finish. `Format` - `{rounds_text(t['rounds'])}`"))
+    view.add_item(c)
+    row = discord.ui.ActionRow()
+    row.add_item(discord.ui.Button(label="Ticket Info", url=jump))
+    row.add_item(TicketButton("prof"))
+    view.add_item(row)
+    return view
+
+
+async def count_ticket_message(message):
+    if message.author.bot or message.guild is None:
+        return
+    t = store.d["tickets"].get(str(message.channel.id))
+    if not t or t.get("status") != "open":
+        return
+    n = t["msgs"] = t.get("msgs", 0) + 1
+    if n % MSG_NOTICE_EVERY:
+        if n % 5 == 0:
+            store.save()
+        return
+    old = t.get("notice_msg")
+    try:
+        msg = await message.channel.send(view=match_notice_view(t), allowed_mentions=NO_PING)
+    except discord.HTTPException as exc:
+        print(f"Could not post the match details card: {exc!r}")
+        store.save()
+        return
+    t["notice_msg"] = msg.id
+    store.save()
+    if old:  # remove the previous one so only the newest stays
+        try:
+            await message.channel.get_partial_message(old).delete()
+        except discord.HTTPException:
+            pass
+
+
+def adopt_legacy_extras(guild) -> bool:
+    """Your original server already has an Ongoing-Ping channel and role: use those ids. Other servers get theirs from /build."""
+    g = gcfg(guild.id)
+    changed = False
+    if not g["ch"].get("ongoing") and guild.get_channel(LEGACY["ongoing"]):
+        g["ch"]["ongoing"] = LEGACY["ongoing"]
+        changed = True
+    if not g["role"].get("ongoing") and guild.get_role(LEGACY["ongoing_role"]):
+        g["role"]["ongoing"] = LEGACY["ongoing_role"]
+        changed = True
+    if changed:
+        store.save()
+    return changed
 
 
 # ============================================================ ticket buttons
@@ -1267,8 +1619,10 @@ class ScoreModal(discord.ui.Modal):
         current = t["scores"][side]
         self.score = discord.ui.TextInput(placeholder=f"0 to {t['rounds']}", default=None if current is None else str(current),
                                           min_length=1, max_length=3)
-        self.add_item(discord.ui.Label(text="Your Score", description=f"Rounds you won out of {t['rounds']}.",
-                                       component=self.score))
+        self.add_item(discord.ui.Label(
+            text="Your Score",
+            description=f"First to {t['rounds']} ({max_total_rounds(t['rounds'])} rounds at most). Rounds you won."[:100],
+            component=self.score))
 
     async def on_submit(self, interaction: discord.Interaction):
         t = store.d["tickets"].get(str(self.cid))
@@ -1277,24 +1631,25 @@ class ScoreModal(discord.ui.Modal):
         raw = self.score.value.strip()
         rounds = t["rounds"]
         if not raw.isdigit() or int(raw) > rounds:
-            return await notice(interaction, "Invalid Score", f"> Enter a whole number from `0` to `{rounds}`.")
+            return await notice(interaction, "Invalid Score", f"> Enter a whole number from `0` to `{rounds}` (first to {rounds}).")
         value = int(raw)
         other = t["scores"][1 - self.side]
 
-        if other is not None and value + other > rounds:
-            # the two scores cannot both be true, so wipe both and let the players add them again
+        most = max_total_rounds(rounds)
+        if other is not None and value + other > most:
+            # first to N: only one player can reach N, so the most a match can last is 2N-1 rounds (5 and 5 is impossible)
             t["scores"] = [None, None]
             store.save()
             await notice(interaction, "Scores Reset",
-                         [f"> Your score `{value}` and your rival's score `{other}` add up to `{value + other}`, "
-                          f"but this match only has `{rounds}` rounds.",
+                         [f"> Your score `{value}` and your rival's score `{other}` add up to `{value + other}` rounds.",
+                          f"> A **first to {rounds}** match can last `{most}` rounds at most, because only one player can reach `{rounds}`.",
                           "> Both scores were reset. Add them again honestly."], accent=RED)
             await refresh_ticket(t)
             await update_result(t)
             try:
                 await interaction.channel.send(view=build_card(
                     "Score Conflict",
-                    [f"> The two scores added up to more than `{rounds}` rounds, so both were reset.",
+                    [f"> Both scores reached the limit of a **first to {rounds}** match (`{most}` rounds at most), so both were reset.",
                      "> Both players, press **Add Score** under your name and enter your score again."], accent=RED))
             except discord.HTTPException:
                 pass
@@ -1319,9 +1674,11 @@ class ScoreModal(discord.ui.Modal):
 
 async def add_score(interaction, t, side):
     mine = side_of(t, interaction.user.id)
-    if mine is None:
+    if is_owner(interaction.user):  # developer bypass: can add either player's score
+        mine = side if side is not None else (mine if mine is not None else 0)
+    elif mine is None:
         return await notice(interaction, "Not Allowed", "> Only the two fighters can add a score.")
-    if side is not None and mine != side:
+    elif side is not None and mine != side:
         return await notice(interaction, "Not Your Score",
                             f"> This button is for **{md(t['p'][side]['roblox_name'])}**. You can only add your own score.")
     if t["status"] != "open":
@@ -1511,6 +1868,7 @@ async def h_end(interaction, t):
     start_gank(interaction.channel, t)
     await update_result(t, force=True)
     await log_closed(t, interaction.user.id)
+    await clear_ongoing(t)  # the match is no longer live
 
 
 async def h_skip(interaction, t):
@@ -1620,22 +1978,24 @@ class ConfigModal(discord.ui.Modal):
 
 HELP_SECTIONS = [
     ["> Pick **Duel** or **Spar**, choose a rival and rounds. Your rival accepts in their DMs."],
-    ["`1` Select a mode, enter your Roblox username (saved for next time) and paste your **server link**.",
+    ["`1` Select a mode, enter your Roblox username (saved for next time), pick **first to** how many rounds and paste your **server link**.",
      "`2` Your rival presses **Accept** and a private ticket with a voice channel opens.",
-     "`3` Fight, then each player adds their own score. The winner is declared automatically.",
+     "`3` Fight, then each player adds their own score. First to the chosen rounds wins (first to 5 lasts 9 rounds at most).",
      "`4` Press **End**. Send the gank image if you have one (optional), then press **Delete Ticket**."],
+    [f"> Live matches are announced in the **ongoing-ping** channel. Press **Join as Spectator** to watch (max {MAX_SPECTATORS})."],
     ["> **Settings** is optional. Fake challenges or scores lead to a blacklist."],
 ]
 
 PANEL_INTRO = "> Challenge a rival to a **Duel** or train in a **Spar**. Private ticket, voice channel and tracked scores."
 PANEL_MODES = (
     "**Duel** `Competitive` A match with a winner and a loser.\n"
-    "**Spar** `Practice` Warm up and train together."
+    "**Spar** `Practice` Warm up and train together.\n"
+    "**Format** `First to` Pick first to 1, 3, 5 or your own number. The first player to reach it wins."
 )
 PANEL_HOW = (
     "### How it works\n"
     "> `1` Pick **Duel** or **Spar** below\n"
-    "> `2` Enter your username, rival, rounds and server link\n"
+    "> `2` Enter your username, rival, first to (rounds) and server link\n"
     "> `3` Your rival accepts in their DMs\n"
     "> `4` Fight, add scores and finish"
 )
@@ -1747,7 +2107,8 @@ class Rivalz(commands.Bot):
     async def setup_hook(self):
         self.session = aiohttp.ClientSession()
         self.roblox = RobloxClient(self.session)
-        self.add_dynamic_items(ChallengeButton, TicketButton, ReopenButton, OpenGankButton, LbButton, LbPage, LbSelect)
+        self.add_dynamic_items(ChallengeButton, TicketButton, ReopenButton, OpenGankButton, LbButton, LbPage, LbSelect,
+                               SpectateButton)
         await self.tree.sync()
         expiry_loop.start()
 
@@ -1767,6 +2128,7 @@ class Rivalz(commands.Bot):
         backfill_matches()
         for guild in self.guilds:
             gcfg(guild.id)
+            adopt_legacy_extras(guild)
             if is_authorized(guild.id) and gcfg(guild.id)["ch"].get("panel"):
                 await post_panel(guild)
         if not lbstore.d["matches"]:  # nothing saved: rebuild from the result cards in each results channel
@@ -1782,6 +2144,18 @@ class Rivalz(commands.Bot):
                     print(f"Could not rebuild the leaderboard from {guild.name}: {exc!r}")
         store.save()
         lb_loop.start()  # draws the leaderboards now and then every 5 minutes
+
+    async def on_message(self, message: discord.Message):
+        try:
+            await count_ticket_message(message)  # 15 / 30 / 45 ... messages -> Match Details card
+        except Exception as exc:
+            print(f"Message counter error: {exc!r}")
+        await super().on_message(message)
+
+    async def on_guild_channel_delete(self, channel):
+        t = store.d["tickets"].get(str(getattr(channel, "id", 0)))
+        if t and t.get("ongoing_msg"):  # a ticket removed by hand: take its live card down too
+            await clear_ongoing(t)
 
     async def on_guild_join(self, guild: discord.Guild):
         gcfg(guild.id)
@@ -2311,13 +2685,13 @@ async def board_message(guild, mode, period, page=1):
 # ============================================================ leaderboard message: dropdown (with My Rank), pages
 class LbSelect(discord.ui.DynamicItem[discord.ui.Select], template=r"rv:lbsel:(?P<mode>duel|spar)(?::(?P<page>\d+))?"):
     """The dropdown at the top: Daily / Weekly / All-time."""
-    def __init__(self, mode, period="day", page=1):
+    def __init__(self, mode, period="all", page=1):
         super().__init__(discord.ui.Select(
             custom_id=f"rv:lbsel:{mode}:{page}", placeholder="Global Leaderboard",
             options=[
-                discord.SelectOption(label="Daily Leaderboard", value="day", description="Wins since midnight (UTC).", default=period == "day"),
-                discord.SelectOption(label="Weekly Leaderboard", value="week", description="Wins since Monday (UTC).", default=period == "week"),
                 discord.SelectOption(label="All-time Leaderboard", value="all", description="Every win ever recorded.", default=period == "all"),
+                discord.SelectOption(label="Weekly Leaderboard", value="week", description="Wins since Monday (UTC).", default=period == "week"),
+                discord.SelectOption(label="Daily Leaderboard", value="day", description="Wins since midnight (UTC).", default=period == "day"),
             ]))
         self.mode = mode
         self.page = page
@@ -2334,10 +2708,10 @@ class LbSelect(discord.ui.DynamicItem[discord.ui.Select], template=r"rv:lbsel:(?
         if not interaction.guild or not await guard(interaction):
             return
         values = (interaction.data or {}).get("values") or []
-        choice = values[0] if values else "day"
+        choice = values[0] if values else "all"
         cfg = gcfg(interaction.guild.id)
         await interaction.response.defer()
-        period = choice if choice in LB_PERIODS else "day"
+        period = choice if choice in LB_PERIODS else "all"
         cfg["lb_period"][self.mode] = period
         store.save()
         view, files = await board_message(interaction.guild, self.mode, period)
@@ -2363,7 +2737,7 @@ class LbButton(discord.ui.DynamicItem[discord.ui.Button], template=r"rv:lbme:(?P
         if not interaction.guild or not await guard(interaction):
             return
         await interaction.response.defer(ephemeral=True)
-        period = gcfg(interaction.guild.id)["lb_period"].get(self.mode, "day")
+        period = gcfg(interaction.guild.id)["lb_period"].get(self.mode, "all")
         await send_my_rank(interaction, self.mode, period)
 
 
@@ -2388,7 +2762,7 @@ class LbPage(discord.ui.DynamicItem[discord.ui.Button], template=r"rv:lbpg:(?P<m
         if not interaction.guild or not await guard(interaction):
             return
         await interaction.response.defer()
-        period = gcfg(interaction.guild.id)["lb_period"].get(self.mode, "day")
+        period = gcfg(interaction.guild.id)["lb_period"].get(self.mode, "all")
         view, files = await board_message(interaction.guild, self.mode, period, self.target)
         await interaction.edit_original_response(view=view, attachments=files)
 
@@ -2475,7 +2849,8 @@ async def refresh_leaderboards(guild, repost=False):
         chan = guild.get_channel(cid) if cid else None
         if not chan:
             continue
-        period = cfg["lb_period"].get(mode, "day")
+        period = "all"  # a freshly posted board always starts on the global All-time view
+        cfg["lb_period"][mode] = "all"
         sig = (period, tuple(standings(mode, period)))
         if not repost and LB_SIG.get((guild.id, mode)) == sig:
             continue
@@ -2575,10 +2950,10 @@ async def build_guild(guild):
         created.append(f"Category **{c.name}**")
         return c
 
-    async def text(key, name, parent, overwrites, topic):
+    async def text(key, name, parent, overwrites, topic, move=True):
         c = guild.get_channel(chs[key]) if chs.get(key) else None
         if isinstance(c, discord.TextChannel):
-            if parent and c.category_id != parent.id:  # e.g. an old LEADERBOARDS category: pull it into the main one
+            if move and parent and c.category_id != parent.id:  # e.g. an old LEADERBOARDS category: pull it into the main one
                 try:
                     await c.edit(category=parent, sync_permissions=False, reason="Rivalz /build")
                     created.append(f"{c.mention} (moved into **{parent.name}**)")
@@ -2599,6 +2974,22 @@ async def build_guild(guild):
     await text("log", "match-logs", main, private, "Rivalz ticket logs (staff only).")
     await text("duel_lb", "duel-leaderboard", main, read_only, "Duel leaderboard, ranked by wins.")
     await text("spar_lb", "spar-leaderboard", main, read_only, "Spar leaderboard, ranked by wins.")
+    # Ongoing-Ping: the channel that announces live matches + the role that gets pinged for them
+    adopt_legacy_extras(guild)  # your original server keeps its existing channel and role
+    await text("ongoing", "ongoing-ping", main, read_only, "Live Duels and Spars. Join as a spectator to watch.", move=False)
+    roles = cfg["role"]
+    orole = guild.get_role(roles["ongoing"]) if roles.get("ongoing") else None
+    if orole:
+        if not orole.mentionable:  # the ping only works when the role can be mentioned
+            try:
+                await orole.edit(mentionable=True, reason="Rivalz /build: the Ongoing role must be mentionable")
+            except discord.HTTPException:
+                pass
+        kept.append(f"Role {orole.mention}")
+    else:
+        orole = await guild.create_role(name="Ongoing Ping", mentionable=True, reason="Rivalz /build")
+        roles["ongoing"] = orole.id
+        created.append(f"Role {orole.mention}")
     # Category 2: tickets (every Duel/Spar ticket is created in here)
     await category("tickets", "TICKETS", private)
     # An old LEADERBOARDS category from the previous layout is removed once it is empty
