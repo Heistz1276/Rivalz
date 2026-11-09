@@ -20,8 +20,11 @@ import subprocess
 import sys
 import time
 import uuid
+import threading
+import atexit
+import urllib.request
 from datetime import datetime, timedelta, timezone
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote as urlquote, urlparse
 
 
 def _bootstrap():
@@ -164,6 +167,235 @@ def daily_backup():
         print(f"Daily backup failed: {exc!r}")
 
 
+# ============================================================ optional free cloud database (Supabase)
+# The bot keeps working from its local SQLite file. When SUPABASE_URL and SUPABASE_KEY are set, every change is also
+# copied to a free Supabase (Postgres) database in the background, and on start-up the cloud copy is restored first.
+# So a redeploy, a wiped disk or a new host never loses the leaderboard, tickets or settings.
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
+CLOUD_ON = bool(SUPABASE_URL and SUPABASE_KEY)
+
+
+def cloud_split(top: str, text: str) -> dict:
+    """One local kv row -> cloud rows. A dict value is split into one row per entry ('top:sub'), so saving one ticket
+    uploads one small row, not every ticket. Anything else (lists, text, lb_meta) is one row."""
+    if top == "lb_meta":
+        return {top: text}
+    try:
+        val = json.loads(text)
+    except Exception:
+        return {top: text}
+    if isinstance(val, dict):
+        return {f"{top}:{sub}": json.dumps(v, separators=(",", ":")) for sub, v in val.items()}
+    return {top: text}
+
+
+def cloud_join(rows: dict) -> dict:
+    """Cloud rows -> local kv rows (the reverse of cloud_split)."""
+    whole, parts = {}, {}
+    for k, v in rows.items():
+        if ":" in k:
+            top, sub = k.split(":", 1)
+            try:
+                parts.setdefault(top, {})[sub] = json.loads(v)
+            except Exception:
+                continue
+        else:
+            whole[k] = v
+    for top, d in parts.items():
+        whole[top] = json.dumps(d, separators=(",", ":"))
+    return whole
+
+
+class Cloud:
+    def __init__(self):
+        self.ready = False
+        self.saved = {}          # cloud key -> text as last confirmed in the cloud
+        self.lock = threading.Lock()
+        self.pend_kv = {}        # cloud key -> text (None = delete)
+        self.pend_up = {}        # (g, m, n) -> match row tuple
+        self.pend_del = set()    # (g, m, n)
+        self.wake = threading.Event()
+        self.last_error = ""
+        self.last_ok = 0.0
+
+    def _call(self, method, path, body=None, extra=None, timeout=25):
+        headers = {"apikey": SUPABASE_KEY, "Content-Type": "application/json"}
+        if SUPABASE_KEY.startswith("eyJ"):          # old style (JWT) keys also go in Authorization
+            headers["Authorization"] = f"Bearer {SUPABASE_KEY}"
+        if extra:
+            headers.update(extra)
+        data = None if body is None else json.dumps(body, separators=(",", ":")).encode("utf-8")
+        req = urllib.request.Request(f"{SUPABASE_URL}/rest/v1/{path}", data=data, method=method, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read()
+        return json.loads(raw) if raw else None
+
+    def _fetch_all(self, table, order):
+        rows, offset = [], 0
+        while True:
+            chunk = self._call("GET", f"{table}?select=*&order={order}&limit=1000&offset={offset}") or []
+            rows.extend(chunk)
+            if len(chunk) < 1000:
+                return rows
+            offset += 1000
+
+    def start(self):
+        if not CLOUD_ON:
+            print("Storage: local SQLite file only. Set SUPABASE_URL and SUPABASE_KEY for the free cloud database.")
+            return
+        try:
+            kv_rows = {r["k"]: r["v"] for r in self._fetch_all("rivalz_kv", "k.asc")}
+            m_rows = self._fetch_all("rivalz_matches", "g.asc,m.asc,n.asc")
+        except Exception as exc:
+            self.last_error = repr(exc)
+            print(f"Cloud database: could not reach Supabase ({exc!r}). Running on the local file only, nothing is uploaded this run.")
+            return
+        if kv_rows or m_rows:   # the cloud copy is the truth: restore it into the local file
+            try:
+                if DB.execute("SELECT COUNT(*) FROM kv").fetchone()[0]:
+                    dest = os.path.join(DATA_DIR, f"rivalz_before_cloud_restore_{datetime.now(timezone.utc).strftime('%Y-%m-%d_%H%M%S')}.sqlite3")
+                    out = sqlite3.connect(dest)
+                    try:
+                        DB.backup(out)
+                    finally:
+                        out.close()
+            except Exception as exc:
+                print(f"Cloud database: could not keep a copy of the local file first: {exc!r}")
+            joined = cloud_join(kv_rows)
+            with DB:
+                DB.execute("DELETE FROM kv")
+                DB.execute("DELETE FROM matches")
+                DB.executemany("INSERT INTO kv (key, value) VALUES (?, ?)", list(joined.items()))
+                DB.executemany("INSERT OR REPLACE INTO matches (g, m, n, ts, w, l, ws, ls) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                               [(r["g"], r["m"], r["n"], r["ts"], r["w"], r["l"], r.get("ws"), r.get("ls")) for r in m_rows])
+            self.saved = dict(kv_rows)
+            print(f"Cloud database: restored {len(kv_rows)} records and {len(m_rows)} matches from Supabase.")
+        else:                   # first run with an empty cloud: upload what is local
+            for key, val in DB.execute("SELECT key, value FROM kv").fetchall():
+                self.pend_kv.update(cloud_split(key, val))
+            for row in DB.execute("SELECT g, m, n, ts, w, l, ws, ls FROM matches").fetchall():
+                self.pend_up[(row[0], row[1], row[2])] = tuple(row)
+            print(f"Cloud database: it is empty, uploading {len(self.pend_kv)} records and {len(self.pend_up)} matches.")
+        self.ready = True
+        threading.Thread(target=self._worker, daemon=True, name="cloud-sync").start()
+        atexit.register(self.flush_now)
+        if self.pend_kv or self.pend_up:
+            self.wake.set()
+
+    def put_top(self, top, text):
+        if not self.ready:
+            return
+        want = cloud_split(top, text)
+        prefix = top + ":"
+        with self.lock:
+            def eff(k):
+                return self.pend_kv[k] if k in self.pend_kv else self.saved.get(k)
+            keys = {k for k in list(self.saved) + list(self.pend_kv) if k == top or k.startswith(prefix)}
+            for k, v in want.items():
+                if eff(k) != v:
+                    self.pend_kv[k] = v
+            for k in keys:
+                if k not in want and eff(k) is not None:
+                    self.pend_kv[k] = None
+        self.wake.set()
+
+    def put_matches(self, rows, gone):
+        if not self.ready:
+            return
+        with self.lock:
+            for r in rows:
+                self.pend_up[(r[0], r[1], r[2])] = tuple(r)
+                self.pend_del.discard((r[0], r[1], r[2]))
+            for k in gone:
+                self.pend_up.pop(tuple(k), None)
+                self.pend_del.add(tuple(k))
+        self.wake.set()
+
+    def pending(self) -> int:
+        with self.lock:
+            return len(self.pend_kv) + len(self.pend_up) + len(self.pend_del)
+
+    def _flush(self) -> bool:
+        with self.lock:
+            kv, up, dele = dict(self.pend_kv), dict(self.pend_up), set(self.pend_del)
+            self.pend_kv.clear()
+            self.pend_up.clear()
+            self.pend_del.clear()
+        if not (kv or up or dele):
+            return True
+        try:
+            merge = {"Prefer": "resolution=merge-duplicates,return=minimal"}
+            rows = [{"k": k, "v": v} for k, v in kv.items() if v is not None]
+            for i in range(0, len(rows), 100):
+                self._call("POST", "rivalz_kv?on_conflict=k", rows[i:i + 100], merge)
+            for k, v in kv.items():
+                if v is None:
+                    self._call("DELETE", "rivalz_kv?k=eq." + urlquote(k, safe=""), None, {"Prefer": "return=minimal"})
+            mrows = [{"g": r[0], "m": r[1], "n": r[2], "ts": r[3], "w": r[4], "l": r[5], "ws": r[6], "ls": r[7]} for r in up.values()]
+            for i in range(0, len(mrows), 100):
+                self._call("POST", "rivalz_matches?on_conflict=g,m,n", mrows[i:i + 100], merge)
+            for g, m, n in dele:
+                self._call("DELETE", f"rivalz_matches?g=eq.{int(g)}&m=eq.{urlquote(str(m), safe='')}&n=eq.{int(n)}", None,
+                           {"Prefer": "return=minimal"})
+        except Exception as exc:
+            with self.lock:   # put back what failed, without overwriting anything newer
+                for k, v in kv.items():
+                    self.pend_kv.setdefault(k, v)
+                for k, r in up.items():
+                    if k not in self.pend_del:
+                        self.pend_up.setdefault(k, r)
+                for k in dele:
+                    if k not in self.pend_up:
+                        self.pend_del.add(k)
+            if str(exc) != self.last_error:
+                print(f"Cloud database: upload failed, will retry ({exc!r})")
+            self.last_error = str(exc)
+            return False
+        with self.lock:
+            for k, v in kv.items():
+                if v is None:
+                    self.saved.pop(k, None)
+                else:
+                    self.saved[k] = v
+        self.last_error = ""
+        self.last_ok = time.time()
+        return True
+
+    def _worker(self):
+        fails = 0
+        while True:
+            self.wake.wait()
+            time.sleep(1.5)          # collect a burst of changes into one upload
+            self.wake.clear()
+            if self._flush():
+                fails = 0
+            else:
+                fails += 1
+                time.sleep(min(60, 5 * fails))
+                self.wake.set()
+
+    def flush_now(self):
+        if self.ready:
+            for _ in range(3):
+                if self._flush():
+                    break
+
+    def status_text(self) -> str:
+        local = f"{len(store.d.get('tickets', {}))} tickets, {len(lbstore.d['matches'])} leaderboard matches stored locally"
+        if not CLOUD_ON:
+            return f"Storage: local file only ({DB_FILE}). {local}. Set SUPABASE_URL and SUPABASE_KEY to turn on the free cloud database."
+        if not self.ready:
+            return f"Storage: Supabase is set up but was not reachable at start-up, so this run uses the local file only. {local}. Last error: {self.last_error or 'unknown'}"
+        ago = f"{int(time.time() - self.last_ok)}s ago" if self.last_ok else "nothing uploaded yet"
+        err = f" Last error: {self.last_error}" if self.last_error else ""
+        return f"Storage: Supabase connected. {local}. Waiting to upload: {self.pending()}. Last upload: {ago}.{err}"
+
+
+CLOUD = Cloud()
+CLOUD.start()
+
+
 class Store:
     """Everything except the leaderboard matches. Same store.d dict as before, saved into SQLite (table kv),
     one row per top-level key. An old rivalz_data.json is imported once when the database is new."""
@@ -192,9 +424,11 @@ class Store:
         for key in ("challenges", "profiles", "tickets", "archive", "guilds"):
             self.d.setdefault(key, {})
         self.d.setdefault("matches", [])
+        self.d.setdefault("trusted", [])   # users the developer trusted (R ta @user): they can use every owner command
         self.save()
 
     def save(self):
+        changed = []
         with DB:  # one transaction: all or nothing
             for k, val in self.d.items():
                 txt = json.dumps(val, separators=(",", ":"))
@@ -202,6 +436,12 @@ class Store:
                     DB.execute("INSERT INTO kv (key, value) VALUES (?, ?) "
                                "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (k, txt))
                     self._saved[k] = txt
+                    changed.append((k, txt))
+        for k, txt in changed:   # copy to the free cloud database too (background, never blocks the bot)
+            try:
+                CLOUD.put_top(k, txt)
+            except Exception as exc:
+                print(f"Cloud sync error: {exc!r}")
 
 
 store = Store(DATA_FILE)
@@ -422,7 +662,7 @@ async def notice(interaction: discord.Interaction, title: str, text, *, accent=R
 async def guard(interaction: discord.Interaction, gid=None) -> bool:
     """True when this server is authorized. Otherwise replies and returns False. The developer always passes."""
     gid = gid or interaction.guild_id
-    if interaction.user.id == OWNER_ID or is_authorized(gid):
+    if is_owner(interaction.user) or is_authorized(gid):
         return True
     await notice(interaction, "Not Authorized",
                  "> Rivalz is not authorized in this server yet. The bot owner needs to run `/authorize`.", accent=GREY)
@@ -445,9 +685,18 @@ async def edit_dm(ch, view):
 
 
 # ============================================================ ticket state helpers
-def is_owner(user) -> bool:
-    """The developer (OWNER_ID) bypasses every restriction."""
+def is_real_owner(user) -> bool:
+    """Only the developer (OWNER_ID): the one person who can trust or untrust others."""
     return bool(OWNER_ID) and getattr(user, "id", None) == OWNER_ID
+
+
+def is_trusted(user) -> bool:
+    return getattr(user, "id", None) in set(store.d.get("trusted") or [])
+
+
+def is_owner(user) -> bool:
+    """The developer and every trusted user (R ta @user) bypass every restriction and can use every owner command."""
+    return is_real_owner(user) or is_trusted(user)
 
 
 def is_staff(user) -> bool:
@@ -779,6 +1028,21 @@ class LogSpectatorsButton(discord.ui.DynamicItem[discord.ui.Button],
             title, [[field("Spectators", len(specs))], lines], accent=GREY), ephemeral=True)
 
 
+async def delete_result_message(url) -> bool:
+    """Deletes a posted result card, given its https://discord.com/channels/<guild>/<channel>/<message> link."""
+    m = re.search(r"/channels/\d+/(\d+)/(\d+)", url or "")
+    if not m:
+        return False
+    chan = await get_channel_safe(int(m.group(1)))
+    if not chan:
+        return False
+    try:
+        await chan.get_partial_message(int(m.group(2))).delete()
+        return True
+    except discord.HTTPException:
+        return False
+
+
 class ReopenButton(discord.ui.DynamicItem[discord.ui.Button], template=r"rv:reopen:(?P<key>[0-9a-f]{8})"):
     def __init__(self, key: str):
         super().__init__(discord.ui.Button(label="Re-Open Ticket", style=discord.ButtonStyle.primary,
@@ -824,6 +1088,10 @@ class ReopenButton(discord.ui.DynamicItem[discord.ui.Button], template=r"rv:reop
                                 "> The ticket could not be re-opened. Both players must still be in the server.")
         unrecord_match(a["guild_id"], a["mode"], a["number"])
         schedule_lb_refresh(a["guild_id"])
+        if a.get("result_url"):  # the old result must not stay in the results channel: the new one replaces it
+            await delete_result_message(a["result_url"])
+            a["result_url"] = None
+            store.save()
         try:
             await interaction.message.edit(view=deleted_view(a, self.key, reopened_by=interaction.user.id),
                                            allowed_mentions=NO_PING)
@@ -1681,6 +1949,7 @@ def adopt_legacy_extras(guild) -> bool:
 # No AI and no API key. The bot only reacts when a message has the word "Rivalz" plus a command it knows
 # (ping, open a channel, list channels, rank, help, owner commands). Anything else is ignored: it never chats.
 RIVALZ_WORD = re.compile(r"(?<![\w'])rivalz(?![\w'])", re.I)
+R_LEAD = re.compile(r"^\s*r[\s,:;.!-]+(?=\S)", re.I)   # a message that starts with "R " works like "Rivalz"
 RIVALZ_LAST = {}
 
 # every unicode emoji block + custom discord emojis + :shortcodes:  -> removed from anything the bot says
@@ -1777,19 +2046,31 @@ OPEN_MISS = ("I looked everywhere, there is no channel like that that you can se
 
 CMD_PING = re.compile(r"^(?:ping|pong|latency|status|are you (?:online|up|alive|there))$")
 CMD_HELP = re.compile(r"^(?:help|commands|what can you do)$")
-CMD_RANK = re.compile(r"^(?:my\s+)?rank(?:\s+me)?$|^what(?:'s| is) my rank$")
-CMD_OWNER = re.compile(r"^(authorize|build|panel|update|backup|deauthorize|deauth)$")
+CMD_RANK = re.compile(r"^(?:my\s+)?(?:rank|stats?)\b(?:\s+.*)?$|^what(?:'s| is) my rank$")
+CMD_LB = re.compile(
+    r"^(?:(?:show|check|see|get|view|what(?:'s| is)|whats)\s+(?:me\s+)?(?:the\s+)?)?"
+    r"(?:current\s+|global\s+|all.?time\s+|daily\s+|weekly\s+|today'?s?\s+)*"
+    r"(?:lb|leaderboards?|standings|rankings?|scoreboard|top\s*#?\d*|best\s+players?)\b.*$"
+    r"|^who(?:'s|s| is| are)\b.*\b(?:top|first|number\s*(?:one|1)|#?1|best|leading|champion|king|winning)\b.*$")
+CMD_TRUST_LIST = re.compile(r"^(?:trusted|trust\s+list|who(?:'s| is| are)\s+trusted)$")
+CMD_TRUST_DEL = re.compile(r"^(?:tr|untrust|trust\s+(?:remove|del(?:ete)?)|remove\s+trust)\b")
+CMD_TRUST_ADD = re.compile(r"^(?:ta|trust(?:\s+add)?|add\s+trust)\b")
+CMD_OWNER = re.compile(r"^(authorize|build|panel|update|backup|deauthorize|deauth|db|database|storage)$")
 CMD_LIST = re.compile(r"^(?:(?:list|show|open)\s+)?(?:all\s+)?(?:the\s+)?channels?"
                       r"(?:\s+(?:in|under|inside|of|from)\s+(?:the\s+)?(?P<cat>.+?))?(?:\s+category)?$")
 CMD_OPEN = re.compile(r"^(?:open|go to|goto|take me to|bring me to|jump to|link|show me|show|join|get)\s+"
                       r"(?:the\s+)?(?:channel\s+)?(?P<name>.+)$")
 LEAD_FILLER = re.compile(r"^(?:(?:hey|hi|yo|ok|okay|please|pls|plz|just|can you|could you|will you|now)\s+)+")
 TAIL_FILLER = re.compile(r"(?:\s+(?:please|pls|plz|bro|now|thanks|thx|for me))+$")
+CAT_WORD = re.compile(r"\b(?:categor(?:y|ies)|cat)\b")
+PERIOD_NAMES = {"all": "All-time", "week": "Weekly", "day": "Daily"}
 
 
 def command_text(message) -> str:
-    """The message without the word 'Rivalz', lower case and tidy: 'Rivalz, open #general please' -> 'open #general'."""
-    text = RIVALZ_WORD.sub(" ", message.clean_content or "").lower()
+    """The message without 'R' / 'Rivalz', lower case and tidy: 'R, open #general please' -> 'open #general'."""
+    raw = message.clean_content or ""
+    raw = R_LEAD.sub(" ", raw, count=1)
+    text = RIVALZ_WORD.sub(" ", raw).lower()
     text = re.sub(r"\s+", " ", text).strip(" ,.!?:;-")
     text = LEAD_FILLER.sub("", text)
     text = TAIL_FILLER.sub("", text).strip(" ,.!?:;-")
@@ -1807,8 +2088,10 @@ def ping_view(api_ms):
                                                 field("Active Tickets", open_tickets)]], accent=GREEN)
 
 
-def rank_view(uid: int):
+def rank_view(uid: int, mention: bool = False):
     sections = []
+    if mention:
+        sections.append([f"> <@{uid}>"])
     for mode in LB_MODES:
         info = rank_info(standings(mode, "all"), uid)
         name = MODES[mode]["name"]
@@ -1817,18 +2100,53 @@ def rank_view(uid: int):
                              f"> **Wins:** {info[1]}  |  **Losses:** {info[2]}"])
         else:
             sections.append([f"**{name}**", "> Unranked. Win a match to get on the board."])
-    return build_card("Your Rank (All-time)", sections, accent=GREEN)
+    return build_card("Rank (All-time)" if mention else "Your Rank (All-time)", sections, accent=GREEN)
+
+
+def lb_query(text: str):
+    """'top 3 duel weekly' / 'who is the best' / 'leaderboard' -> (mode or None, period, how many)."""
+    mode = "duel" if re.search(r"\bduels?\b", text) else "spar" if re.search(r"\bspar(?:s|ring)?\b", text) else None
+    period = "day" if re.search(r"\b(?:daily|today|day)\b", text) else "week" if re.search(r"\b(?:weekly|week)\b", text) else "all"
+    m = re.search(r"\b(?:top|first)\s*#?(\d{1,2})\b", text) or re.search(r"#(\d{1,2})\b", text)
+    if m:
+        n = int(m.group(1))
+    elif re.match(r"^who", text) or re.search(r"\bnumber\s*(?:one|1)\b|\bbest\b|\bchampion\b|\bking\b", text):
+        n = 1
+    else:
+        n = 3
+    return mode, period, max(1, min(10, n))
+
+
+def lb_stats_view(mode, period, n):
+    modes = [mode] if mode else list(LB_MODES)
+    since = period_start(period)
+    sections = []
+    for md_ in modes:
+        rows = standings(md_, period)
+        total = sum(1 for x in lbstore.d["matches"] if x["m"] == md_ and x["ts"] >= since)
+        lines = [f"**{MODES[md_]['name']}** - `{total}` matches, `{len(rows)}` players"]
+        if not rows:
+            lines.append("> Nobody is on this board yet.")
+        for i, (uid, w, l) in enumerate(rows[:n]):
+            rb = (store.d["profiles"].get(str(uid)) or {}).get("roblox_name")
+            who = f"<@{uid}>" + (f" (`@{esc(rb)}`)" if rb else "")
+            pct = round(w / (w + l) * 100) if (w + l) else 0
+            lines.append(f"> **#{i + 1}** {who} - {w}W / {l}L ({pct}%)")
+        sections.append(lines)
+    return build_card(f"Leaderboard - {PERIOD_NAMES[period]}", sections, accent=GREEN)
 
 
 def help_view():
     return build_card("Rivalz Commands", [
-        ["> Type **Rivalz** and a command instead of using `/`."],
-        ["`Rivalz ping` - check that Rivalz is online",
-         "`Rivalz open general` - posts the channel link and a button that jumps straight to it (short names work, like `ann`)",
-         "`Rivalz channels` or `Rivalz channels in <category>` - list the channels you can see",
-         "`Rivalz rank` - your Duel and Spar rank"],
-        ["> Developer only: `Rivalz update`, `Rivalz panel`, `Rivalz build`, `Rivalz authorize`, `Rivalz backup`, "
-         "`Rivalz deauthorize`."],
+        ["> Start a message with **R** or **Rivalz** and a command instead of using `/`."],
+        ["`R ping` - check that Rivalz is online",
+         "`R leaderboard` / `R top 3` / `R who is top 1` - current standings (add `duel`, `spar`, `weekly`, `daily`)",
+         "`R rank` or `R rank @user` - Duel and Spar rank",
+         "`R open general` - posts the channel link and a button that jumps straight to it (short names work, like `ann`)",
+         "`R open Divisions category` - lists every channel in that category",
+         "`R channels` / `R channels in <category>` - list the channels you can see"],
+        ["> Developer and trusted users: `R update`, `R panel`, `R build`, `R authorize`, `R backup`, `R db`, `R deauthorize`.",
+         "> Developer only: `R ta @user` trusts someone (full owner access), `R tr @user` removes it, `R trusted` lists them."],
     ], accent=GREY)
 
 
@@ -1870,10 +2188,13 @@ def list_channels_text(message, category: str = ""):
         groups = [(cat.name, [c for c in cat.channels if can_see(c, member)])]
     elif q:
         cats = [c for c in guild.categories if can_see(c, member)]
-        found = best_matches(clean_query(q), cats, lambda c: c.name, cap=1)
+        query = clean_query(q)
+        found = best_matches(query, cats, lambda c: c.name, cap=6)
+        if not found and query.endswith("s") and len(query) > 3:      # "divisions" -> "division 1", "division 2" ...
+            found = best_matches(query[:-1], cats, lambda c: c.name, cap=6)
         if not found:
             return None, "No category that you can see matches that name."
-        groups = [(found[0].name, [c for c in found[0].channels if can_see(c, member)])]
+        groups = [(c.name, [x for x in c.channels if can_see(x, member)]) for c in found]
     else:
         groups = []
         loose = [c for c in channel_pool(guild, member) if c.category_id is None]
@@ -1884,7 +2205,7 @@ def list_channels_text(message, category: str = ""):
     lines = []
     for name, chans in groups:
         if chans:
-            lines.append(f"**{strip_emoji(name) or name}**")
+            lines.append(f"**{strip_emoji(name) or name}** ({len(chans)})")
             lines.append(" ".join(c.mention for c in chans))
     if not lines:
         return None, "There are no channels that you can see there."
@@ -1892,12 +2213,19 @@ def list_channels_text(message, category: str = ""):
 
 
 async def open_channels(message, name: str):
-    """'Rivalz open general' -> the clickable channel mention + a link button that jumps straight into it."""
+    """'R open general' -> the clickable channel mention + a link button. 'R open Divisions category' -> every channel in it."""
     guild, member = message.guild, message.author
+    base = CAT_WORD.sub(" ", name).strip()
+    if CAT_WORD.search(name) and base:
+        text, err = list_channels_text(message, base)
+        return await reply_text(message, text or err)
     found = [c for c in message.channel_mentions if can_see(c, member)]   # a real #channel mention always wins
     if not found:
         found = best_matches(clean_query(name), channel_pool(guild, member), lambda c: c.name, cap=5)
     if not found:
+        text, _err = list_channels_text(message, name)     # maybe the name was a category ("R open divisions")
+        if text:
+            return await reply_text(message, text)
         return await reply_text(message, random.choice(OPEN_MISS))
     found = found[:5]
     view = discord.ui.View(timeout=None)
@@ -1908,7 +2236,7 @@ async def open_channels(message, name: str):
 
 
 async def do_update(guild) -> list:
-    """Same as /update, for 'Rivalz update'. Never removes anything."""
+    """Same as /update, for 'R update'. Never removes anything."""
     perms = guild.me.guild_permissions
     if not (perms.manage_channels and perms.manage_roles):
         return ["Rivalz needs Manage Channels and Manage Roles first."]
@@ -1923,20 +2251,49 @@ async def do_update(guild) -> list:
             f"{len(created)} channel(s) created."]
 
 
+def trust_add(uid: int) -> bool:
+    lst = store.d.setdefault("trusted", [])
+    if uid in lst:
+        return False
+    lst.append(uid)
+    store.save()
+    return True
+
+
+def trust_remove(uid: int) -> bool:
+    lst = store.d.setdefault("trusted", [])
+    if uid not in lst:
+        return False
+    lst.remove(uid)
+    store.save()
+    return True
+
+
+def target_of(message):
+    """Who a command points at: the first @mention (not the bot), else a typed user id."""
+    for u in message.mentions:
+        if u.id != bot.user.id and not u.bot:
+            return u.id
+    m = re.search(r"\b(\d{15,20})\b", message.content or "")
+    return int(m.group(1)) if m else None
+
+
 async def owner_command(message, command: str) -> str:
     g, c = message.guild, (command or "").strip().lower().lstrip("/")
     if c == "deauth":
         c = "deauthorize"
+    if c in ("db", "database", "storage"):
+        return CLOUD.status_text()
     if c == "authorize":
         cfg = gcfg(g.id)
         was = cfg["authorized"]
         cfg["authorized"] = True
         cfg["authorized_by"], cfg["authorized_at"] = message.author.id, int(time.time())
         store.save()
-        return "This server was already authorized." if was else "Authorized this server. Say Rivalz build next."
+        return "This server was already authorized." if was else "Authorized this server. Say R build next."
     if c == "build":
         if not is_authorized(g.id):
-            return "Not authorized yet. Say Rivalz authorize first."
+            return "Not authorized yet. Say R authorize first."
         perms = g.me.guild_permissions
         if not (perms.manage_channels and perms.manage_roles):
             return "The bot needs Manage Channels and Manage Roles first."
@@ -1945,10 +2302,10 @@ async def owner_command(message, command: str) -> str:
         await refresh_leaderboards(g, repost=True)
         return f"Built: {len(created)} created, {len(kept)} already there."
     if c == "panel":
-        return "Panel reposted." if await post_panel(g) else "Could not post the panel. Say Rivalz build first."
+        return "Panel reposted." if await post_panel(g) else "Could not post the panel. Say R build first."
     if c == "update":
         if not is_authorized(g.id):
-            return "Not authorized yet. Say Rivalz authorize first."
+            return "Not authorized yet. Say R authorize first."
         return " ".join(await do_update(g))
     if c == "backup":
         tmp = None
@@ -1986,9 +2343,27 @@ async def rivalz_text(message):
         return
     m_open = CMD_OPEN.match(text)
     m_list = CMD_LIST.match(text)
-    kind = ("ping" if CMD_PING.match(text) else "help" if CMD_HELP.match(text) else "rank" if CMD_RANK.match(text)
-            else "owner" if CMD_OWNER.match(text) else "list" if m_list else "open" if m_open else None)
-    if kind is None:
+    if CMD_PING.match(text):
+        kind = "ping"
+    elif CMD_HELP.match(text):
+        kind = "help"
+    elif CMD_TRUST_LIST.match(text):
+        kind = "trust_list"
+    elif CMD_TRUST_DEL.match(text):
+        kind = "trust_remove"
+    elif CMD_TRUST_ADD.match(text):
+        kind = "trust_add"
+    elif CMD_OWNER.match(text):
+        kind = "owner"
+    elif CMD_RANK.match(text):
+        kind = "rank"
+    elif CMD_LB.match(text):
+        kind = "lb"
+    elif m_list:
+        kind = "list"
+    elif m_open:
+        kind = "open"
+    else:
         return                       # not a command: stay silent, never chat
     uid = message.author.id
     now = time.time()
@@ -2006,7 +2381,30 @@ async def rivalz_text(message):
     if kind == "help":
         return await message.reply(view=help_view(), mention_author=False, allowed_mentions=NO_PING)
     if kind == "rank":
-        return await message.reply(view=rank_view(uid), mention_author=False, allowed_mentions=NO_PING)
+        target = target_of(message)
+        return await message.reply(view=rank_view(target or uid, mention=bool(target and target != uid)),
+                                   mention_author=False, allowed_mentions=NO_PING)
+    if kind == "lb":
+        mode, period, n = lb_query(text)
+        return await message.reply(view=lb_stats_view(mode, period, n), mention_author=False, allowed_mentions=NO_PING)
+    if kind in ("trust_add", "trust_remove", "trust_list"):
+        if not is_real_owner(message.author):
+            return await reply_text(message, "Only the developer can manage trusted users.")
+        if kind == "trust_list":
+            ids = store.d.get("trusted") or []
+            return await reply_text(message, "Trusted: " + " ".join(f"<@{i}>" for i in ids) if ids else "Nobody is trusted yet.")
+        target = target_of(message)
+        if not target:
+            return await reply_text(message, "Mention who, like `R ta @name` or `R tr @name`.")
+        if target == OWNER_ID:
+            return await reply_text(message, "That is you, the developer. You already have full access.")
+        if kind == "trust_add":
+            if trust_add(target):
+                return await reply_text(message, f"<@{target}> is trusted now. They can use every owner command and the full bot.")
+            return await reply_text(message, f"<@{target}> is already trusted.")
+        if trust_remove(target):
+            return await reply_text(message, f"<@{target}> is not trusted any more.")
+        return await reply_text(message, f"<@{target}> was not trusted.")
     if kind == "owner":
         if not is_owner(message.author):
             return await reply_text(message, "Owner only.")
@@ -2064,6 +2462,11 @@ class TicketButton(discord.ui.DynamicItem[discord.ui.Button],
             return await safe_reply(interaction, "This ticket is no longer tracked by Rivalz.")
         if not await guard(interaction, t["guild_id"]):
             return
+        user = interaction.user
+        if self.act not in ("join", "prof") and is_spectator(t, user) and side_of(t, user.id) is None:
+            # a spectator (even one with staff powers) can only look: no End, no Add Score, nothing else
+            return await notice(interaction, "Spectator", "> Spectators can only use **Join**, **Profile** and **Join VC**.",
+                                accent=GREY)
         await TICKET_HANDLERS[self.act](interaction, t)
 
 
@@ -2405,11 +2808,26 @@ async def handle_gank_message(message):
     await finalize_match(message.channel, t)
 
 
+def auto_fill_scores(t) -> bool:
+    """First to N: a player who added N has won, even when the rival never added a score. The rival's score counts as 0
+    so the match is still calculated and recorded."""
+    n = t["rounds"]
+    s = t["scores"]
+    for i in (0, 1):
+        if s[i] is not None and s[i] >= n and s[1 - i] is None:
+            s[1 - i] = 0
+            t["score_assumed"] = 1 - i
+            store.save()
+            return True
+    return False
+
+
 async def h_end(interaction, t):
     if not can_act(t, interaction.user):
         return await notice(interaction, "Not Allowed", "> Only the two fighters can end this match.")
     if t["status"] != "open":
         return await notice(interaction, "Already Ended", "> This match has already ended.")
+    auto_fill_scores(t)
     if None in t["scores"] and not is_staff(interaction.user):
         return await notice(interaction, "Scores Missing",
                             "> Both players must add their own score before the match can end.", accent=RED)
@@ -2635,7 +3053,7 @@ class PanelView(discord.ui.LayoutView):
 class GuardedTree(app_commands.CommandTree):
     """Every slash command is owner only, except /ping (it works for everyone, in any server)."""
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id == OWNER_ID:
+        if is_owner(interaction.user):
             return True
         cmd = interaction.command
         if cmd is not None and cmd.name == "ping":     # /ping is the only command everyone can use
@@ -2734,8 +3152,9 @@ class Rivalz(commands.Bot):
             await handle_gank_message(message)
         except Exception as exc:
             print(f"Gank handler error: {exc!r}")
-        try:  # "Rivalz ping", "Rivalz open general" ... only known commands are answered
-            if message.guild and not message.author.bot and message.content and RIVALZ_WORD.search(message.content):
+        try:  # "R ping", "Rivalz open general" ... only known commands are answered
+            if (message.guild and not message.author.bot and message.content
+                    and (RIVALZ_WORD.search(message.content) or R_LEAD.match(message.content))):
                 asyncio.create_task(rivalz_task(message))
         except Exception as exc:
             print(f"Rivalz trigger error: {exc!r}")
@@ -3054,12 +3473,18 @@ class LbStore:
             cur[(row[0], row[1], row[2])] = row
         gone = [k for k in self._keys if k not in cur]
         new = [cur[k] for k in cur if k not in self._keys]
+        meta = json.dumps({"backfilled": bool(self.d.get("backfilled")), "reset_id": self.d.get("reset_id")})
         with DB:  # one transaction: all or nothing
             DB.executemany("DELETE FROM matches WHERE g = ? AND m = ? AND n = ?", gone)
             DB.executemany("INSERT OR REPLACE INTO matches (g, m, n, ts, w, l, ws, ls) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", new)
             DB.execute("INSERT INTO kv (key, value) VALUES ('lb_meta', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                       (json.dumps({"backfilled": bool(self.d.get("backfilled")), "reset_id": self.d.get("reset_id")}),))
+                       (meta,))
         self._keys = set(cur)
+        try:   # copy to the free cloud database too
+            CLOUD.put_matches(new, gone)
+            CLOUD.put_top("lb_meta", meta)
+        except Exception as exc:
+            print(f"Cloud sync error: {exc!r}")
         daily_backup()
 
 
@@ -3682,7 +4107,7 @@ async def ping_roblox(interaction: discord.Interaction):
 @bot.tree.command(name="panel", description="Owner only: repost the Rivalz panel in this server.")
 @app_commands.guild_only()
 async def panel(interaction: discord.Interaction):
-    if interaction.user.id != OWNER_ID:
+    if not is_owner(interaction.user):
         return await interaction.response.send_message("Owner only.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
     ok = await post_panel(interaction.guild)
@@ -3692,7 +4117,7 @@ async def panel(interaction: discord.Interaction):
 @bot.tree.command(name="authorize", description="Owner only: authorize Rivalz to be used in this server.")
 @app_commands.guild_only()
 async def authorize(interaction: discord.Interaction):
-    if interaction.user.id != OWNER_ID:
+    if not is_owner(interaction.user):
         return await interaction.response.send_message("Owner only.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
     cfg = gcfg(interaction.guild.id)
@@ -3710,7 +4135,7 @@ async def authorize(interaction: discord.Interaction):
 @bot.tree.command(name="build", description="Owner only: create the Rivalz categories and channels (run /authorize first).")
 @app_commands.guild_only()
 async def build(interaction: discord.Interaction):
-    if interaction.user.id != OWNER_ID:
+    if not is_owner(interaction.user):
         return await interaction.response.send_message("Owner only.", ephemeral=True)
     guild = interaction.guild
     if not is_authorized(guild.id):
@@ -3813,7 +4238,7 @@ class DeauthorizeConfirm(discord.ui.View):
         self.used = False
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != OWNER_ID:
+        if not is_owner(interaction.user):
             await interaction.response.send_message("Owner only.", ephemeral=True)
             return False
         return True
@@ -3851,7 +4276,7 @@ class DeauthorizeConfirm(discord.ui.View):
 @bot.tree.command(name="deauthorize", description="Owner only: delete every channel Rivalz created in this server, then leave it.")
 @app_commands.guild_only()
 async def deauthorize(interaction: discord.Interaction):
-    if interaction.user.id != OWNER_ID:
+    if not is_owner(interaction.user):
         return await interaction.response.send_message("Owner only.", ephemeral=True)
     await interaction.response.send_message(
         "This deletes every channel, category, ticket, voice channel and role Rivalz created in this server, forgets the "
@@ -3862,7 +4287,7 @@ async def deauthorize(interaction: discord.Interaction):
 @bot.tree.command(name="restoreboard", description="Owner only: put leaderboard wins back from an old data file.")
 @app_commands.describe(file="leaderboard_data.json, leaderboard_data.json.bak or rivalz_data.json from your old folder")
 async def restoreboard(interaction: discord.Interaction, file: discord.Attachment):
-    if interaction.user.id != OWNER_ID:
+    if not is_owner(interaction.user):
         return await interaction.response.send_message("Owner only.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
     if file.size > 25 * 1024 * 1024:
@@ -3926,7 +4351,7 @@ async def restoreboard(interaction: discord.Interaction, file: discord.Attachmen
 @bot.tree.command(name="rebuildboard", description="Owner only: rebuild the leaderboard from the result cards in a results channel.")
 @app_commands.describe(channel="The results channel to read (default: this server's results channel)")
 async def rebuildboard(interaction: discord.Interaction, channel: discord.TextChannel = None):
-    if interaction.user.id != OWNER_ID:
+    if not is_owner(interaction.user):
         return await interaction.response.send_message("Owner only.", ephemeral=True)
     if not interaction.guild:
         return await interaction.response.send_message("Use this inside a server.", ephemeral=True)
@@ -3952,7 +4377,7 @@ async def rebuildboard(interaction: discord.Interaction, channel: discord.TextCh
 
 @bot.tree.command(name="backup", description="Owner only: download a copy of the Rivalz database.")
 async def backup_cmd(interaction: discord.Interaction):
-    if interaction.user.id != OWNER_ID:
+    if not is_owner(interaction.user):
         return await interaction.response.send_message("Owner only.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
     tmp = None
@@ -3982,7 +4407,7 @@ async def backup_cmd(interaction: discord.Interaction):
 @app_commands.choices(mode=[app_commands.Choice(name="Duel", value="duel"), app_commands.Choice(name="Spar", value="spar")])
 async def addmatch(interaction: discord.Interaction, mode: app_commands.Choice[str], winner: discord.User,
                    loser: discord.User, days_ago: app_commands.Range[int, 0, 3650] = 0):
-    if interaction.user.id != OWNER_ID:
+    if not is_owner(interaction.user):
         return await interaction.response.send_message("Owner only.", ephemeral=True)
     if winner.id == loser.id:
         return await notice(interaction, "Invalid", "> The winner and loser must be different people.")
@@ -3999,7 +4424,7 @@ async def addmatch(interaction: discord.Interaction, mode: app_commands.Choice[s
 @bot.tree.command(name="update", description="Owner only: update Rivalz in this server to its current features. Nothing is removed.")
 @app_commands.guild_only()
 async def update_cmd(interaction: discord.Interaction):
-    if interaction.user.id != OWNER_ID:
+    if not is_owner(interaction.user):
         return await interaction.response.send_message("Owner only.", ephemeral=True)
     guild = interaction.guild
     if not is_authorized(guild.id):
@@ -4036,9 +4461,11 @@ async def help_cmd(interaction: discord.Interaction):
         [f"> Challenge rivals to a **Duel** or **Spar** from the matchmaking panel. First to the chosen rounds wins."],
         ["`/ping` - check that Rivalz is online (everyone)",
          "`/rank`, `/panel`, `/authorize`, `/build`, `/update`, `/backup`, `/deauthorize` ... - owner only"],
-        ["> You can also type **Rivalz** and a command: `Rivalz ping`, `Rivalz open general`, `Rivalz channels`, `Rivalz rank`.",
-         "> Owner only: `Rivalz update`, `Rivalz panel`, `Rivalz build`, `Rivalz authorize`, `Rivalz backup`, `Rivalz deauthorize`.",
-         "> Watch a live match from the ongoing-ping channel with **Join as Spectator** (max 3). Spectators can only use the join link and send the gank image."],
+        ["> You can also start a message with **R** or **Rivalz**: `R ping`, `R leaderboard`, `R top 3`, `R rank`, `R open general`, "
+         "`R open Divisions category`, `R channels`.",
+         "> Developer and trusted users: `R update`, `R panel`, `R build`, `R authorize`, `R backup`, `R db`, `R deauthorize`. "
+         "Developer only: `/trust add`, `/trust remove` (or `R ta @user`, `R tr @user`).",
+         "> Watch a live match from the ongoing-ping channel with **Join as Spectator** (max 3). Spectators can only use Join, Profile and Join VC, plus send the gank image."],
     ], accent=GREY), ephemeral=True)
 
 
@@ -4058,6 +4485,42 @@ async def rank_cmd(interaction: discord.Interaction):
     await interaction.followup.send(view=build_card("Your Rank (All-time)", sections, accent=GREEN), ephemeral=True)
 
 
+trust_group = app_commands.Group(name="trust", description="Developer only: trusted users get full owner access.", guild_only=True)
+
+
+@trust_group.command(name="add", description="Developer only: trust a user so they can use every owner command and the full bot.")
+@app_commands.describe(user="Who to trust")
+async def trust_add_cmd(interaction: discord.Interaction, user: discord.User):
+    if not is_real_owner(interaction.user):
+        return await interaction.response.send_message("Only the developer can manage trusted users.", ephemeral=True)
+    if user.bot or user.id == OWNER_ID:
+        return await interaction.response.send_message("Pick a real user other than yourself.", ephemeral=True)
+    text = f"{user.mention} is trusted now. They can use every owner command and the full bot." if trust_add(user.id) \
+        else f"{user.mention} is already trusted."
+    await interaction.response.send_message(text, ephemeral=True, allowed_mentions=NO_PING)
+
+
+@trust_group.command(name="remove", description="Developer only: remove a user's trust.")
+@app_commands.describe(user="Who to remove")
+async def trust_remove_cmd(interaction: discord.Interaction, user: discord.User):
+    if not is_real_owner(interaction.user):
+        return await interaction.response.send_message("Only the developer can manage trusted users.", ephemeral=True)
+    text = f"{user.mention} is not trusted any more." if trust_remove(user.id) else f"{user.mention} was not trusted."
+    await interaction.response.send_message(text, ephemeral=True, allowed_mentions=NO_PING)
+
+
+@trust_group.command(name="list", description="Developer only: see who is trusted.")
+async def trust_list_cmd(interaction: discord.Interaction):
+    if not is_real_owner(interaction.user):
+        return await interaction.response.send_message("Only the developer can manage trusted users.", ephemeral=True)
+    ids = store.d.get("trusted") or []
+    await interaction.response.send_message("Trusted: " + " ".join(f"<@{i}>" for i in ids) if ids else "Nobody is trusted yet.",
+                                            ephemeral=True, allowed_mentions=NO_PING)
+
+
+bot.tree.add_command(trust_group)
+
+
 @bot.tree.error
 async def on_tree_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     print(f"Command error: {error!r}")
@@ -4067,6 +4530,19 @@ async def on_tree_error(interaction: discord.Interaction, error: app_commands.Ap
 if __name__ == "__main__":
     if not TOKEN or TOKEN.startswith("PUT_"):
         raise SystemExit("Set DISCORD_TOKEN (in .env or your host's Variables) first.")
+    if CLOUD_ON:  # a redeploy stops the bot with SIGTERM: copy the last changes to the cloud first
+        import signal
+
+        def _flush_and_stop(signum, frame):
+            try:
+                CLOUD.flush_now()
+            finally:
+                signal.signal(signum, signal.SIG_DFL)
+                os.kill(os.getpid(), signum)
+        try:
+            signal.signal(signal.SIGTERM, _flush_and_stop)
+        except (ValueError, OSError, AttributeError):
+            pass
     try:
         bot.run(TOKEN)
     except discord.PrivilegedIntentsRequired:
