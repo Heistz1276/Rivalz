@@ -92,7 +92,7 @@ MAX_ROUNDS = env_int("MAX_ROUNDS", 25)
 GANK_SECONDS = 120
 MAX_SPECTATORS = 3            # how many spectators one live match can have (the developer is not counted)
 RIVALZ_COOLDOWN = 3           # seconds between "Rivalz <command>" messages from the same person (the developer is exempt)
-LB_RESET_ID = ""   # leaderboard wipe is OFF (scores are never reset). Set an id here only if you ever want a one-time wipe
+LB_RESET_ID = "fresh-start-2026-11-09"   # ONE-TIME leaderboard wipe: runs once per database, then never again. Change the text only if you ever want another wipe
 MSG_NOTICE_EVERY = 15         # the "Match Details" card is posted at 15 messages, again at 30 (old one removed), 45, ...
 LB_MODES = ("duel", "spar")
 
@@ -107,8 +107,12 @@ def find_gif() -> str:
 
 
 GIF_PATH = find_gif()
-DATA_DIR = os.getenv("DATA_DIR", "").strip() or BASE_DIR
+ON_RAILWAY = bool(os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("RAILWAY_PROJECT_ID") or os.getenv("RAILWAY_SERVICE_ID"))
+VOLUME_DIR = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
+# Order: DATA_DIR you set > the Railway volume (auto) > the code folder (WIPED on every Railway deploy!)
+DATA_DIR = os.getenv("DATA_DIR", "").strip() or VOLUME_DIR or BASE_DIR
 os.makedirs(DATA_DIR, exist_ok=True)
+EPHEMERAL_DISK = ON_RAILWAY and not (os.getenv("DATA_DIR", "").strip() or VOLUME_DIR)
 DATA_FILE = os.path.join(DATA_DIR, "rivalz_data.json")
 
 MODES = {
@@ -249,7 +253,8 @@ class Cloud:
             m_rows = self._fetch_all("rivalz_matches", "g.asc,m.asc,n.asc")
         except Exception as exc:
             self.last_error = repr(exc)
-            print(f"Cloud database: could not reach Supabase ({exc!r}). Running on the local file only, nothing is uploaded this run.")
+            print(f"Cloud database: could not reach Supabase ({exc!r}). Running on the local file for now, will keep retrying.")
+            threading.Thread(target=self._late_connect, daemon=True, name="cloud-retry").start()
             return
         if kv_rows or m_rows:   # the cloud copy is the truth: restore it into the local file
             try:
@@ -282,6 +287,29 @@ class Cloud:
         atexit.register(self.flush_now)
         if self.pend_kv or self.pend_up:
             self.wake.set()
+
+    def _late_connect(self):
+        """Supabase was down at start-up: retry every 30s. Once it answers, what this run saved locally is uploaded
+        (nothing in the cloud is overwritten or deleted by this)."""
+        while not self.ready:
+            time.sleep(30)
+            try:
+                self._fetch_all("rivalz_kv", "k.asc")
+            except Exception as exc:
+                self.last_error = repr(exc)
+                continue
+            try:
+                for key, val in DB.execute("SELECT key, value FROM kv").fetchall():
+                    self.pend_kv.update(cloud_split(key, val))
+                for row in DB.execute("SELECT g, m, n, ts, w, l, ws, ls FROM matches").fetchall():
+                    self.pend_up[(row[0], row[1], row[2])] = tuple(row)
+            except Exception as exc:
+                print(f"Cloud database: late upload prepare failed: {exc!r}")
+            self.ready = True
+            threading.Thread(target=self._worker, daemon=True, name="cloud-sync").start()
+            atexit.register(self.flush_now)
+            self.wake.set()
+            print("Cloud database: Supabase is reachable now, uploading the local data.")
 
     def put_top(self, top, text):
         if not self.ready:
@@ -3112,11 +3140,19 @@ class Rivalz(commands.Bot):
         migrate_legacy()
         recover_matches()
         backfill_matches()
+        if EPHEMERAL_DISK and not CLOUD_ON:
+            print("WARNING: Railway disk is temporary and no Volume / Supabase is set. Every deploy forgets /authorize and /build! "
+                  "Add a Railway Volume (mount path /data) or set SUPABASE_URL + SUPABASE_KEY.")
+            await tell_owner("WARNING: Rivalz has no permanent storage on Railway, so every update forgets `/authorize` and `/build`. "
+                             "Add a **Volume** to the service (mount path `/data`) or set `SUPABASE_URL` and `SUPABASE_KEY`.")
         for guild in self.guilds:
-            gcfg(guild.id)
-            adopt_legacy_extras(guild)
-            if is_authorized(guild.id) and gcfg(guild.id)["ch"].get("panel"):
-                await post_panel(guild, force=updated)
+            try:
+                gcfg(guild.id)
+                adopt_legacy_extras(guild)
+                if is_authorized(guild.id) and gcfg(guild.id)["ch"].get("panel"):
+                    await post_panel(guild, force=updated)
+            except Exception as exc:
+                print(f"Start-up panel check failed in {guild.name}: {exc!r}")
         if not lbstore.d["matches"] and not lbstore.d.get("reset_id"):  # nothing saved: rebuild from the result cards
             for guild in self.guilds:
                 rid = gcfg(guild.id)["ch"].get("results") or (LEGACY["results"] if guild.get_channel(LEGACY["results"]) else None)
@@ -3142,6 +3178,7 @@ class Rivalz(commands.Bot):
         store.d["code_hash"] = CODE_HASH
         store.save()
         lb_loop.start()  # draws the leaderboards now and then every 5 minutes
+        health_loop.start()  # every 10 minutes: every authorized server still has its panel, boards and channels
 
     async def on_message(self, message: discord.Message):
         try:
@@ -3168,6 +3205,16 @@ class Rivalz(commands.Bot):
     async def on_guild_join(self, guild: discord.Guild):
         gcfg(guild.id)
         store.save()
+        if is_authorized(guild.id):   # the server is already set up (its data was kept): just repair and repost
+            try:
+                await build_guild(guild)
+                await post_panel(guild)
+                await refresh_leaderboards(guild, repost=True)
+                await tell_owner(f"Rivalz re-joined **{guild.name}** (`{guild.id}`). It was already authorized, so the channels, panel and leaderboards were repaired automatically.")
+            except Exception as exc:
+                print(f"Re-join repair failed in {guild.name}: {exc!r}")
+                await tell_owner(f"Rivalz re-joined **{guild.name}** (`{guild.id}`) but could not repair it: `{exc!r}`. Run `/build`.")
+            return
         await tell_owner(f"Rivalz joined **{guild.name}** (`{guild.id}`). Run `/authorize` there, then `/build`.")
 
 
@@ -3689,10 +3736,15 @@ async def lookup_user(uid):
     hit = USER_CACHE.get(uid) or {}
     if hit and time.time() - hit["ts"] < 60:
         return hit["name"], hit["data"]
-    name, data, key = hit.get("name", f"user{str(uid)[-4:]}"), hit.get("data"), hit.get("key")
+    saved_name = (store.d.get("names") or {}).get(str(uid))
+    name, data, key = hit.get("name") or saved_name or f"user{str(uid)[-4:]}", hit.get("data"), hit.get("key")
     try:
         user = await bot.fetch_user(uid)
         name = user.name
+        names = store.d.setdefault("names", {})
+        if names.get(str(uid)) != name:   # saved, so the right username survives restarts and Discord hiccups
+            names[str(uid)] = name
+            store.save()
         akey = user.display_avatar.key
         if akey != key or data is None:
             data = await user.display_avatar.replace(size=128, format="png").read()
@@ -3966,16 +4018,62 @@ def schedule_lb_refresh(gid=None):
         await asyncio.sleep(8)
         for guild in list(bot.guilds):
             if is_authorized(guild.id):
-                await refresh_leaderboards(guild)
+                try:
+                    await refresh_leaderboards(guild)
+                except Exception as exc:
+                    print(f"Leaderboard refresh failed in {guild.name}: {exc!r}")
 
     LB_TASKS["all"] = asyncio.create_task(later())
+
+
+async def check_guild_health(guild):
+    """Makes sure one authorized server still has its panel message (reposts it if missing) and its leaderboards."""
+    cfg = gcfg(guild.id)
+    cid = cfg["ch"].get("panel")
+    if not cid:
+        return
+    chan = guild.get_channel(cid)
+    if chan is None:   # the panel channel was deleted: recreate whatever is missing, then repost
+        await build_guild(guild)
+        await post_panel(guild)
+        await refresh_leaderboards(guild, repost=True)
+        return
+    mid = cfg.get("panel_msg")
+    try:
+        if not mid:
+            raise discord.NotFound(None, "no panel saved")
+        await chan.fetch_message(mid)
+    except discord.NotFound:
+        await post_panel(guild)
+    except discord.HTTPException:
+        pass   # a Discord hiccup: look again in 10 minutes
+    await refresh_leaderboards(guild)
+
+
+@tasks.loop(minutes=10)
+async def health_loop():
+    for guild in list(bot.guilds):
+        if not is_authorized(guild.id):
+            continue
+        try:
+            await check_guild_health(guild)
+        except Exception as exc:
+            print(f"Health check failed in {guild.name}: {exc!r}")
+
+
+@health_loop.before_loop
+async def _health_wait():
+    await bot.wait_until_ready()
 
 
 @tasks.loop(minutes=5)
 async def lb_loop():
     for guild in list(bot.guilds):
         if is_authorized(guild.id):
-            await refresh_leaderboards(guild)  # new wins, new profile pictures and Daily/Weekly roll-overs
+            try:
+                await refresh_leaderboards(guild)  # new wins, new profile pictures and Daily/Weekly roll-overs
+            except Exception as exc:
+                print(f"Leaderboard refresh failed in {guild.name}: {exc!r}")
 
 
 # ============================================================ /authorize + /build
