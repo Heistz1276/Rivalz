@@ -140,7 +140,7 @@ DB_FILE = os.path.join(DATA_DIR, "rivalz.sqlite3")
 def open_db():
     db = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=30)
     db.execute("PRAGMA journal_mode=WAL")
-    db.execute("PRAGMA synchronous=FULL")
+    db.execute("PRAGMA synchronous=NORMAL")   # safe with WAL; FULL made every save wait on slow volume disks and delayed replies
     db.execute("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
     db.execute("""CREATE TABLE IF NOT EXISTS matches (
         g INTEGER NOT NULL, m TEXT NOT NULL, n INTEGER NOT NULL, ts INTEGER NOT NULL,
