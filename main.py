@@ -90,9 +90,9 @@ LEGACY = {
 EXPIRY_MINUTES = env_int("CHALLENGE_EXPIRY_MINUTES", 30)
 MAX_ROUNDS = env_int("MAX_ROUNDS", 25)
 GANK_SECONDS = 120
-MAX_SPECTATORS = 3            # how many spectators one live match can have (the developer is not counted)
+# Spectators have NO limit. A member can only spectate ONE live match at a time (see active_spectating).
 RIVALZ_COOLDOWN = 3           # seconds between "Rivalz <command>" messages from the same person (the developer is exempt)
-LB_RESET_ID = "fresh-start-2026-11-09"   # ONE-TIME leaderboard wipe: runs once per database, then never again. Change the text only if you ever want another wipe
+LB_RESET_ID = ""   # leaderboard wipe is DISABLED. Nothing is ever reset or deleted by an update.
 MSG_NOTICE_EVERY = 15         # the "Match Details" card is posted at 15 messages, again at 30 (old one removed), 45, ...
 LB_MODES = ("duel", "spar")
 
@@ -530,6 +530,52 @@ def is_authorized(gid) -> bool:
     return bool(gid) and bool(store.d["guilds"].get(str(gid), {}).get("authorized"))
 
 
+# Authorized servers are ALSO remembered in a tiny separate file, in the AUTHORIZED_GUILDS variable, and any server
+# owned by the developer is trusted automatically. So an update / redeploy / wiped database never makes the bot say
+# "not authorized yet" in a server that was already set up.
+AUTH_BACKUP = os.path.join(DATA_DIR, "authorized_guilds.json")
+ENV_AUTH_GUILDS = {int(x) for x in re.findall(r"\d{15,20}", os.getenv("AUTHORIZED_GUILDS", ""))}
+
+
+def sync_auth_backup():
+    try:
+        ids = sorted(int(g) for g, c in store.d["guilds"].items() if c.get("authorized"))
+        with open(AUTH_BACKUP, "w", encoding="utf-8") as fh:
+            json.dump(ids, fh)
+    except Exception as exc:
+        print(f"Could not save the authorized-server list: {exc!r}")
+
+
+def authorize_guild(gid, by=None):
+    cfg = gcfg(gid)
+    cfg["authorized"] = True
+    if by:
+        cfg["authorized_by"], cfg["authorized_at"] = by, int(time.time())
+    store.save()
+    sync_auth_backup()
+
+
+def restore_authorization(guilds):
+    """Run at start-up (after every update): re-authorize servers that were authorized before."""
+    remembered = set(ENV_AUTH_GUILDS)
+    try:
+        with open(AUTH_BACKUP, "r", encoding="utf-8") as fh:
+            remembered |= {int(x) for x in json.load(fh)}
+    except Exception:
+        pass
+    changed = False
+    for guild in guilds:
+        if is_authorized(guild.id):
+            continue
+        if guild.id in remembered or (OWNER_ID and guild.owner_id == OWNER_ID):
+            gcfg(guild.id)["authorized"] = True
+            changed = True
+            print(f"Re-authorized {guild.name} automatically.")
+    if changed:
+        store.save()
+    sync_auth_backup()
+
+
 def cfg_channel_id(gid, key):
     return gcfg(gid)["ch"].get(key)
 
@@ -854,7 +900,7 @@ def ticket_view(t, ping=False):
         info += f"\n> **Voice:** <#{t['vc_id']}>"
     specs = t.get("spectators") or []
     if specs:
-        info += f"\n> **Spectators:** `{spec_count(t)}/{MAX_SPECTATORS}`"
+        info += f"\n> **Spectators:** `{spec_count(t)}`"
         for s in specs[:12]:
             who = f" (`@{esc(s['roblox_name'])}`)" if s.get("roblox_name") else ""
             info += f"\n> - <@{s['discord_id']}>{who}"
@@ -1180,6 +1226,13 @@ async def update_result(t, by_id=None, force=False, files=None) -> bool:
         return False
     if t.get("result_msg"):
         kwargs = {"attachments": files} if files else {}
+        if not files and t.get("gank_card"):   # an edit must never drop the gank picture
+            try:
+                old = await chan.fetch_message(t["result_msg"])
+                if old.attachments:
+                    kwargs = {"attachments": list(old.attachments)}
+            except discord.HTTPException:
+                pass
         try:
             await chan.get_partial_message(t["result_msg"]).edit(view=view, allowed_mentions=NO_PING, **kwargs)
             return True
@@ -1592,7 +1645,7 @@ def ongoing_view(t, role_id=None):
         field("Rounds", rounds_text(t["rounds"])),
         field("Server", server_label(t.get("server"))),
         f"**Started:** <t:{int(t['created'])}:R>",
-        field("Spectators", f"{spec_count(t)}/{MAX_SPECTATORS}"),
+        field("Spectators", spec_count(t)),
     ])))
     specs = spec_list(t)
     if specs:
@@ -1788,8 +1841,7 @@ async def send_spectator_card(interaction, t, entry, already=False):
     info = [field("Match", f"{m['name']} #{t['number']:03d}")]
     if entry.get("roblox_name"):
         info.append(field("Roblox", entry["roblox_name"]))
-    info.append(field("Spectator Slot", "Developer (no limit)" if entry.get("dev")
-                      else f"{spec_count(t)}/{MAX_SPECTATORS}"))
+    info.append(field("Spectators Watching", spec_count(t)))
     if roblox:
         how = ["> Tap **Open Roseal** first and pick how to launch Roblox, or use **Open Roblox Directly**."]
         if not roseal:
@@ -1804,6 +1856,29 @@ async def send_spectator_card(interaction, t, entry, already=False):
             await interaction.response.send_message(view=view, ephemeral=True)
     except discord.HTTPException:
         pass
+
+
+def active_spectating(uid: int, exclude_cid=None):
+    """The live (open) match this member is already spectating, or None. Ended matches do not count, so as soon
+    as the first match ends the member is free to spectate a new one. Matches whose channel is gone are ignored."""
+    for other in store.d["tickets"].values():
+        if other.get("status") != "open" or other.get("channel_id") == exclude_cid:
+            continue
+        if not any(s.get("discord_id") == uid for s in (other.get("spectators") or [])):
+            continue
+        if bot.get_channel(other["channel_id"]) is None:   # ticket deleted by hand: not live any more
+            continue
+        return other
+    return None
+
+
+async def already_spectating_notice(interaction, other):
+    m = MODES[other["mode"]]
+    return await notice(
+        interaction, "Already Spectating",
+        [f"> You are already spectating **{m['name']} #{other['number']:03d}**.",
+         "> You can only watch one live match at a time. Once that match ends you can spectate a new one.",
+         f"> Ticket: {ticket_jump(other)}"], accent=GREY)
 
 
 async def add_spectator(interaction, t, rb):
@@ -1821,9 +1896,10 @@ async def add_spectator(interaction, t, rb):
         have = next((s for s in spec_list(t) if s["discord_id"] == user.id), None)
         if have:
             return await send_spectator_card(interaction, t, have, already=True)
-        if not dev and spec_count(t) >= MAX_SPECTATORS:
-            return await notice(interaction, "Spectators Full",
-                                f"> This match already has `{MAX_SPECTATORS}/{MAX_SPECTATORS}` spectators.", accent=GREY)
+        if not dev:
+            other = active_spectating(user.id, t["channel_id"])
+            if other:
+                return await already_spectating_notice(interaction, other)
         entry = {"discord_id": user.id, "dev": dev, "joined": int(time.time())}
         if rb:
             entry.update(roblox_id=rb.get("id"), roblox_name=rb.get("name"), roblox_display=rb.get("display"))
@@ -1907,9 +1983,9 @@ class SpectateButton(discord.ui.DynamicItem[discord.ui.Button], template=r"rv:sp
         if is_owner(user):  # developer bypass: no username, no slot limit
             await interaction.response.defer(ephemeral=True)
             return await add_spectator(interaction, t, None)
-        if spec_count(t) >= MAX_SPECTATORS:
-            return await notice(interaction, "Spectators Full",
-                                f"> This match already has `{MAX_SPECTATORS}/{MAX_SPECTATORS}` spectators.", accent=GREY)
+        other = active_spectating(user.id, t["channel_id"])
+        if other:
+            return await already_spectating_notice(interaction, other)
         await interaction.response.send_modal(SpectatorModal(self.cid, store.d["profiles"].get(str(user.id), {})))
 
 
@@ -2315,13 +2391,11 @@ async def owner_command(message, command: str) -> str:
     if c == "authorize":
         cfg = gcfg(g.id)
         was = cfg["authorized"]
-        cfg["authorized"] = True
-        cfg["authorized_by"], cfg["authorized_at"] = message.author.id, int(time.time())
-        store.save()
+        authorize_guild(g.id, message.author.id)
         return "This server was already authorized." if was else "Authorized this server. Say R build next."
     if c == "build":
         if not is_authorized(g.id):
-            return "Not authorized yet. Say R authorize first."
+            authorize_guild(g.id, message.author.id)
         perms = g.me.guild_permissions
         if not (perms.manage_channels and perms.manage_roles):
             return "The bot needs Manage Channels and Manage Roles first."
@@ -2333,7 +2407,7 @@ async def owner_command(message, command: str) -> str:
         return "Panel reposted." if await post_panel(g) else "Could not post the panel. Say R build first."
     if c == "update":
         if not is_authorized(g.id):
-            return "Not authorized yet. Say R authorize first."
+            authorize_guild(g.id, message.author.id)
         return " ".join(await do_update(g))
     if c == "backup":
         tmp = None
@@ -2503,6 +2577,16 @@ def is_spectator(t, user) -> bool:
     return any(s.get("discord_id") == user.id for s in (t.get("spectators") or []))
 
 
+def spectator_only(t, user) -> bool:
+    """True for a spectator who is not one of the two fighters (even with staff powers): they can only watch."""
+    return is_spectator(t, user) and side_of(t, user.id) is None
+
+
+async def spectator_refused(interaction):
+    return await notice(interaction, "Spectator", "> Spectators can only watch. They cannot end, score, skip or delete a match.",
+                        accent=GREY)
+
+
 async def h_join(interaction, t):
     if not (can_act(t, interaction.user) or is_spectator(t, interaction.user)):
         return await notice(interaction, "Not Allowed", "> Only the two fighters and the spectators can use the join link.")
@@ -2623,14 +2707,20 @@ async def add_score(interaction, t, side):
 
 
 async def h_s0(interaction, t):
+    if spectator_only(t, interaction.user):
+        return await spectator_refused(interaction)
     await add_score(interaction, t, 0)
 
 
 async def h_s1(interaction, t):
+    if spectator_only(t, interaction.user):
+        return await spectator_refused(interaction)
     await add_score(interaction, t, 1)
 
 
 async def h_score(interaction, t):  # older tickets only
+    if spectator_only(t, interaction.user):
+        return await spectator_refused(interaction)
     await add_score(interaction, t, None)
 
 
@@ -2725,6 +2815,8 @@ async def attach_gank_to_result(t):
         ok = await update_result(t, force=True, files=make_files(with_full=False))
     if not ok:
         t["gank_card"] = None
+    elif t.get("result_msg"):
+        store.d.setdefault("gank_urls", {})[str(t["result_msg"])] = t["gank_url"]
     store.save()
 
 
@@ -2851,6 +2943,8 @@ def auto_fill_scores(t) -> bool:
 
 
 async def h_end(interaction, t):
+    if spectator_only(t, interaction.user):
+        return await spectator_refused(interaction)
     if not can_act(t, interaction.user):
         return await notice(interaction, "Not Allowed", "> Only the two fighters can end this match.")
     if t["status"] != "open":
@@ -2879,6 +2973,8 @@ async def h_end(interaction, t):
 
 
 async def h_skip(interaction, t):
+    if spectator_only(t, interaction.user):
+        return await spectator_refused(interaction)
     if not can_act(t, interaction.user):
         return await notice(interaction, "Not Allowed", "> Only the two fighters can skip the gank.")
     if t["status"] != "ended":
@@ -2905,18 +3001,51 @@ class OpenGankButton(discord.ui.DynamicItem[discord.ui.Button], template=r"rv:ga
         print(f"OpenGankButton error: {error!r}")
 
     async def callback(self, interaction: discord.Interaction):
-        atts = list(interaction.message.attachments) if interaction.message else []
+        msg = interaction.message
+        atts = list(msg.attachments) if msg else []
+        if not atts and msg is not None:   # the click can arrive without the attachments: read the message again
+            try:
+                msg = await interaction.channel.fetch_message(msg.id)
+                atts = list(msg.attachments)
+            except Exception as exc:
+                print(f"Open Gank: could not re-read the result card: {exc!r}")
         att = (next((a for a in atts if a.filename.startswith("gank_full")), None)
-               or next((a for a in atts if a.filename.startswith("gank_card")), None))
-        if not att:
+               or next((a for a in atts if a.filename.startswith("gank_card")), None)
+               or next((a for a in atts if a.filename.lower().endswith(IMG_EXT)), None))
+        url = att.url if att else None
+        if not url and msg is not None:    # the picture shown inside the card itself
+            url = gank_media_url(getattr(msg, "components", None))
+        if not url and msg is not None:    # last resort: the link saved when the gank was attached
+            url = (store.d.get("gank_urls") or {}).get(str(msg.id))
+        if not url:
             return await notice(interaction, "No Gank", "> The gank image is no longer available.", accent=GREY)
         await interaction.response.send_message(view=build_card(
             "Gank", ["> Full-size gank image. Tap the image to enlarge it."],
-            media=att.url, accent=GREY, timeout=600,
-            buttons=[discord.ui.Button(label="Open Original", url=att.url)]), ephemeral=True)
+            media=url, accent=GREY, timeout=600,
+            buttons=[discord.ui.Button(label="Open Original", url=url)]), ephemeral=True)
+
+
+def gank_media_url(components):
+    """The first picture URL inside a Components V2 message (media galleries), or None."""
+    found = []
+
+    def walk(c):
+        for item in getattr(c, "items", None) or []:
+            media = getattr(item, "media", None)
+            u = getattr(media, "url", None) or getattr(media, "proxy_url", None)
+            if isinstance(u, str) and u.startswith("http"):
+                found.append(u)
+        for ch in getattr(c, "children", None) or []:
+            walk(ch)
+
+    for c in components or []:
+        walk(c)
+    return found[0] if found else None
 
 
 async def h_delete(interaction, t):
+    if spectator_only(t, interaction.user):
+        return await spectator_refused(interaction)
     if not can_act(t, interaction.user):
         return await notice(interaction, "Not Allowed", "> Only the two fighters or staff can delete this ticket.")
     if t["status"] != "finished":
@@ -2989,7 +3118,7 @@ HELP_SECTIONS = [
      "`2` Your rival presses **Accept** and a private ticket with a voice channel opens.",
      "`3` Fight, then each player adds their own score. First to the chosen rounds wins (first to 5 lasts 9 rounds at most).",
      "`4` Press **End**. Send the gank image if you have one (optional), then press **Delete Ticket**."],
-    [f"> Live matches are announced in the **ongoing-ping** channel. Press **Join as Spectator** to watch (max {MAX_SPECTATORS})."],
+    [f"> Live matches are announced in the **ongoing-ping** channel. Press **Join as Spectator** to watch (no limit, one match at a time)."],
     ["> **Settings** is optional. Fake challenges or scores lead to a blacklist."],
 ]
 
@@ -3084,7 +3213,7 @@ class GuardedTree(app_commands.CommandTree):
         if is_owner(interaction.user):
             return True
         cmd = interaction.command
-        if cmd is not None and cmd.name == "ping":     # /ping is the only command everyone can use
+        if cmd is not None and cmd.qualified_name in ("ping", "my rank"):     # /ping and /my rank work for everyone
             return True
         await safe_reply(interaction, "Owner only.")
         return False
@@ -3093,7 +3222,9 @@ class GuardedTree(app_commands.CommandTree):
 def migrate_legacy():
     """Your original server keeps working: it is marked authorized and keeps its existing channels and categories."""
     for guild in bot.guilds:
-        if str(guild.id) in store.d["guilds"] or not guild.get_channel(LEGACY["panel"]):
+        if not guild.get_channel(LEGACY["panel"]):
+            continue
+        if str(guild.id) in store.d["guilds"] and is_authorized(guild.id):
             continue
         g = gcfg(guild.id)
         g["authorized"], g["legacy"] = True, True
@@ -3138,6 +3269,7 @@ class Rivalz(commands.Bot):
         store.d["code_hash"] = CODE_HASH   # remembered right away, so a crash and restart is not treated as a new version
         store.save()
         migrate_legacy()
+        restore_authorization(self.guilds)
         recover_matches()
         backfill_matches()
         if EPHEMERAL_DISK and not CLOUD_ON:
@@ -3475,7 +3607,7 @@ class LbStore:
     so ticket clean-ups can never touch it. self.d["matches"] is the in-memory copy; save() writes only what changed."""
     def __init__(self, legacy_json: str):
         self.legacy = legacy_json
-        self.d = {"matches": [], "backfilled": False}
+        self.d = {"matches": [], "backfilled": False, "adjust": {}}
         self._keys = set()
         for g, m, n, ts, w, l, ws, ls in DB.execute("SELECT g, m, n, ts, w, l, ws, ls FROM matches"):
             self.d["matches"].append({"g": g, "m": m, "n": n, "ts": ts, "w": w, "l": l, "ws": ws, "ls": ls})
@@ -3487,6 +3619,7 @@ class LbStore:
                 info = json.loads(meta[0])
                 self.d["backfilled"] = bool(info.get("backfilled"))
                 self.d["reset_id"] = info.get("reset_id")
+                self.d["adjust"] = info.get("adjust") or {}
             except Exception:
                 pass
         if not self.d["matches"] and not self.d["reset_id"]:  # after a reset, old files are never pulled back in
@@ -3520,7 +3653,8 @@ class LbStore:
             cur[(row[0], row[1], row[2])] = row
         gone = [k for k in self._keys if k not in cur]
         new = [cur[k] for k in cur if k not in self._keys]
-        meta = json.dumps({"backfilled": bool(self.d.get("backfilled")), "reset_id": self.d.get("reset_id")})
+        meta = json.dumps({"backfilled": bool(self.d.get("backfilled")), "reset_id": self.d.get("reset_id"),
+                           "adjust": self.d.get("adjust") or {}})
         with DB:  # one transaction: all or nothing
             DB.executemany("DELETE FROM matches WHERE g = ? AND m = ? AND n = ?", gone)
             DB.executemany("INSERT OR REPLACE INTO matches (g, m, n, ts, w, l, ws, ls) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", new)
@@ -3715,7 +3849,11 @@ def standings(mode, period):
             continue
         tally.setdefault(x["w"], [0, 0])[0] += 1
         tally.setdefault(x["l"], [0, 0])[1] += 1
-    return sorted(((uid, w, l) for uid, (w, l) in tally.items()), key=lambda r: (-r[1], r[2], r[0]))
+    if period == "all":   # counts set by hand with /set count d|s (all-time board only)
+        for uid, (dw, dl) in ((lbstore.d.get("adjust") or {}).get(mode) or {}).items():
+            e = tally.setdefault(int(uid), [0, 0])
+            e[0], e[1] = max(0, e[0] + dw), max(0, e[1] + dl)
+    return sorted(((uid, w, l) for uid, (w, l) in tally.items() if w or l), key=lambda r: (-r[1], r[2], r[0]))
 
 
 def rank_info(rows, uid):
@@ -4220,9 +4358,7 @@ async def authorize(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     cfg = gcfg(interaction.guild.id)
     was = cfg["authorized"]
-    cfg["authorized"] = True
-    cfg["authorized_by"], cfg["authorized_at"] = interaction.user.id, int(time.time())
-    store.save()
+    authorize_guild(interaction.guild.id, interaction.user.id)
     built = bool(cfg["ch"].get("panel"))
     lines = ["> Rivalz is now authorized in this server." if not was else "> This server was already authorized."]
     lines.append("> Everything is set up. Use `/build` any time to repair missing channels." if built
@@ -4237,7 +4373,7 @@ async def build(interaction: discord.Interaction):
         return await interaction.response.send_message("Owner only.", ephemeral=True)
     guild = interaction.guild
     if not is_authorized(guild.id):
-        return await notice(interaction, "Not Authorized", "> Run `/authorize` in this server first, then `/build`.", accent=GREY)
+        authorize_guild(guild.id, interaction.user.id)
     await interaction.response.defer(ephemeral=True)
     perms = guild.me.guild_permissions
     if not (perms.manage_channels and perms.manage_roles):
@@ -4320,6 +4456,8 @@ async def deauthorize_guild(guild) -> list:
             c["status"] = "expired"
     store.d["guilds"].pop(str(guild.id), None)
     store.save()
+    ENV_AUTH_GUILDS.discard(guild.id)
+    sync_auth_backup()
     summary = [f"Removed {removed} channel(s), categories or roles from {guild.name}."]
     if failed:
         summary.append(f"{failed} could not be deleted (check the bot's Manage Channels / Manage Roles permission).")
@@ -4526,7 +4664,7 @@ async def update_cmd(interaction: discord.Interaction):
         return await interaction.response.send_message("Owner only.", ephemeral=True)
     guild = interaction.guild
     if not is_authorized(guild.id):
-        return await notice(interaction, "Not Authorized", "> Run `/authorize` in this server first.", accent=GREY)
+        authorize_guild(guild.id, interaction.user.id)
     await interaction.response.defer(ephemeral=True)
     perms = guild.me.guild_permissions
     if not (perms.manage_channels and perms.manage_roles):
@@ -4558,12 +4696,14 @@ async def help_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(view=build_card("Rivalz Help", [
         [f"> Challenge rivals to a **Duel** or **Spar** from the matchmaking panel. First to the chosen rounds wins."],
         ["`/ping` - check that Rivalz is online (everyone)",
+         "`/my rank` - your Duel and Spar rank, wins, losses and win rate (everyone)",
+         "`/set count d`, `/set count s` - set a player's leaderboard count (developer only)",
          "`/rank`, `/panel`, `/authorize`, `/build`, `/update`, `/backup`, `/deauthorize` ... - owner only"],
         ["> You can also start a message with **R** or **Rivalz**: `R ping`, `R leaderboard`, `R top 3`, `R rank`, `R open general`, "
          "`R open Divisions category`, `R channels`.",
          "> Developer and trusted users: `R update`, `R panel`, `R build`, `R authorize`, `R backup`, `R db`, `R deauthorize`. "
          "Developer only: `/trust add`, `/trust remove` (or `R ta @user`, `R tr @user`).",
-         "> Watch a live match from the ongoing-ping channel with **Join as Spectator** (max 3). Spectators can only use Join, Profile and Join VC, plus send the gank image."],
+         "> Watch a live match from the ongoing-ping channel with **Join as Spectator** (no limit, one match at a time). Spectators can only use Join, Profile and Join VC, plus send the gank image."],
     ], accent=GREY), ephemeral=True)
 
 
@@ -4581,6 +4721,86 @@ async def rank_cmd(interaction: discord.Interaction):
         else:
             sections.append([f"**{name}**", "> Unranked. Win a match to get on the board."])
     await interaction.followup.send(view=build_card("Your Rank (All-time)", sections, accent=GREEN), ephemeral=True)
+
+
+my_group = app_commands.Group(name="my", description="Your own Rivalz stats.")
+
+
+def win_rate_text(w: int, l: int) -> str:
+    """Win rate as 00.00% (wins / (wins + losses))."""
+    return f"{(w / (w + l) * 100) if (w + l) else 0.0:05.2f}%"
+
+
+@my_group.command(name="rank", description="See your Duel and Spar rank, wins, losses and win rate.")
+async def my_rank_cmd(interaction: discord.Interaction):
+    await interaction.response.defer()
+    user = interaction.user
+    embed = discord.Embed(title=user.display_name, colour=GREEN)
+    embed.set_thumbnail(url=user.display_avatar.url)
+    tw = tl = 0
+    for mode in LB_MODES:
+        name = MODES[mode]["name"]
+        info = rank_info(standings(mode, "all"), user.id)
+        if info:
+            rank, w, l, top = info
+            tw, tl = tw + w, tl + l
+            body = (f"**Rank:** `#{rank}` (Top {top:.2f}%)\n"
+                    f"**Wins:** `{w}`\n**Losses:** `{l}`\n**Matches:** `{w + l}`\n"
+                    f"**Win Rate:** `{win_rate_text(w, l)}`")
+        else:
+            body = ("**Rank:** Unranked\n**Wins:** `0`\n**Losses:** `0`\n**Matches:** `0`\n"
+                    f"**Win Rate:** `{win_rate_text(0, 0)}`")
+        embed.add_field(name=name, value=body, inline=True)
+    embed.add_field(name="Overall", value=(f"**Wins:** `{tw}`\n**Losses:** `{tl}`\n**Matches:** `{tw + tl}`\n"
+                                            f"**Win Rate:** `{win_rate_text(tw, tl)}`"), inline=False)
+    embed.set_footer(text="Rivalz | Global all-time leaderboard")
+    await interaction.followup.send(embed=embed)
+
+
+bot.tree.add_command(my_group)
+
+
+set_group = app_commands.Group(name="set", description="Developer only: leaderboard tools.")
+count_group = app_commands.Group(name="count", description="Developer only: set a player's leaderboard count.", parent=set_group)
+
+
+async def set_count(interaction: discord.Interaction, mode: str, user: discord.User, wins, losses):
+    if not is_real_owner(interaction.user):
+        return await interaction.response.send_message("Only the developer can use this command.", ephemeral=True)
+    if wins is None and losses is None:
+        return await interaction.response.send_message("Give at least `wins` or `losses`.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    # what the saved matches already give this player on the all-time board (without any earlier manual change)
+    adj = lbstore.d.setdefault("adjust", {}).setdefault(mode, {})
+    adj.pop(str(user.id), None)
+    cur_w, cur_l = next(((w, l) for u, w, l in standings(mode, "all") if u == user.id), (0, 0))
+    new_w = cur_w if wins is None else wins
+    new_l = cur_l if losses is None else losses
+    adj[str(user.id)] = [new_w - cur_w, new_l - cur_l]
+    if adj[str(user.id)] == [0, 0]:
+        adj.pop(str(user.id), None)
+    lbstore.save()
+    schedule_lb_refresh()
+    await notice(interaction, "Leaderboard Count Set",
+                 [f"> **{MODES[mode]['name']}:** {user.mention} is now `{new_w}` wins / `{new_l}` losses (all-time).",
+                  "> The boards refresh in a few seconds. Matches already recorded are kept."], accent=GREEN)
+
+
+@count_group.command(name="d", description="Developer only: set a player's DUEL wins / losses on the leaderboard.")
+@app_commands.describe(user="Whose count to set", wins="Total duel wins", losses="Total duel losses")
+async def set_count_d(interaction: discord.Interaction, user: discord.User,
+                      wins: app_commands.Range[int, 0, 100000] = None, losses: app_commands.Range[int, 0, 100000] = None):
+    await set_count(interaction, "duel", user, wins, losses)
+
+
+@count_group.command(name="s", description="Developer only: set a player's SPAR wins / losses on the leaderboard.")
+@app_commands.describe(user="Whose count to set", wins="Total spar wins", losses="Total spar losses")
+async def set_count_s(interaction: discord.Interaction, user: discord.User,
+                      wins: app_commands.Range[int, 0, 100000] = None, losses: app_commands.Range[int, 0, 100000] = None):
+    await set_count(interaction, "spar", user, wins, losses)
+
+
+bot.tree.add_command(set_group)
 
 
 trust_group = app_commands.Group(name="trust", description="Developer only: trusted users get full owner access.", guild_only=True)
