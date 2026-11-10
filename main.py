@@ -1011,7 +1011,7 @@ async def log_opened(t):
         ["-# Rivalz"],
     ]
     buttons = [discord.ui.Button(label="More Info", url=ticket_jump(t))]
-    await send_cfg(t["guild_id"], "log", build_card(f"{m['name']}-ticket #{t['number']:03d} Opened", sections,
+    await send_cfg(t["guild_id"], "log", build_card(f"🎫 {m['name']}-ticket #{t['number']:03d} Opened", sections,
                                              accent=m["colour"], buttons=buttons))
 
 
@@ -1051,7 +1051,7 @@ def deleted_view(a, key, reopened_by=None):
         buttons.append(discord.ui.Button(label="More Info", url=a["result_url"]))
     buttons.append(discord.ui.Button(label="Open Profile", url=profile_url(a["p"][0])))  # the requester
     buttons.append(LogSpectatorsButton(a["guild_id"], a["mode"], a["number"]))
-    return build_card(f"{m['name']}-ticket #{a['number']:03d} Deleted", [fields, ["-# Rivalz"]],
+    return build_card(f"🗑️ {m['name']}-ticket #{a['number']:03d} Deleted", [fields, ["-# Rivalz"]],
                       accent=GREY, buttons=buttons)
 
 
@@ -1623,8 +1623,8 @@ def spec_list(t) -> list:
 
 
 def spec_count(t) -> int:
-    """Spectators that use up a slot (the developer never does)."""
-    return sum(1 for s in spec_list(t) if not s.get("dev"))
+    """Every spectator watching the match (developers included, so the number matches the list)."""
+    return len(spec_list(t))
 
 
 def ongoing_view(t, role_id=None):
@@ -3281,7 +3281,7 @@ class GuardedTree(app_commands.CommandTree):
         if is_owner(interaction.user):
             return True
         cmd = interaction.command
-        if cmd is not None and cmd.qualified_name in ("ping", "check stats"):     # /ping and /check stats work for everyone
+        if cmd is not None and cmd.qualified_name in ("ping", "member stats"):     # /ping and /member stats work for everyone
             return True
         await safe_reply(interaction, "Owner only.")
         return False
@@ -3389,11 +3389,11 @@ class Rivalz(commands.Bot):
             await handle_gank_message(message)
         except Exception as exc:
             print(f"Gank handler error: {exc!r}")
-        try:  # .check stats / /check stats / ?check stats typed as a normal message
-            if message.guild and not message.author.bot and message.content and CHECK_STATS_RE.match(message.content):
-                asyncio.create_task(check_stats_text(message))
+        try:  # .member stats / /member stats / ?member stats typed as a normal message
+            if message.guild and not message.author.bot and message.content and MEMBER_STATS_RE.match(message.content):
+                asyncio.create_task(member_stats_text(message))
         except Exception as exc:
-            print(f"Check stats trigger error: {exc!r}")
+            print(f"Member stats trigger error: {exc!r}")
         try:  # "R ping", "Rivalz open general" ... only known commands are answered
             if (message.guild and not message.author.bot and message.content
                     and (RIVALZ_WORD.search(message.content) or R_LEAD.match(message.content))):
@@ -4769,7 +4769,7 @@ async def help_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(view=build_card("Rivalz Help", [
         [f"> Challenge rivals to a **Duel** or **Spar** from the matchmaking panel. First to the chosen rounds wins."],
         ["`/ping` - check that Rivalz is online (everyone)",
-         "`/check stats [member]` - Overall, Duel and Spar stats. Also `.check stats`, `/check stats`, `?check stats` (everyone)",
+         "`/member stats [member]` - Overall stats with Duel and Spar buttons. Also `.member stats`, `?member stats` (everyone)",
          "`/set count d`, `/set count s` - set a player's leaderboard count (developer only)",
          "`/rank`, `/panel`, `/authorize`, `/build`, `/update`, `/backup`, `/deauthorize` ... - owner only"],
         ["> You can also start a message with **R** or **Rivalz**: `R ping`, `R leaderboard`, `R top 3`, `R rank`, `R open general`, "
@@ -4796,21 +4796,19 @@ async def rank_cmd(interaction: discord.Interaction):
     await interaction.followup.send(view=build_card("Your Rank (All-time)", sections, accent=GREEN), ephemeral=True)
 
 
-# ============================================================ /check stats  (also  .check stats  /check stats  ?check stats)
+# ============================================================ /member stats  (also  .member stats  ?member stats)
 STATS_BLACK = 0x010101      # Discord treats pure 0 as "no colour", so this is the darkest real black
-STATS_VIEWS = ("overall", "duel", "spar")
-CHECK_STATS_RE = re.compile(r"^\s*[./?]\s*check\s*stats?\b[\s,:;-]*(?P<who>.*)$", re.I | re.S)
+MEMBER_STATS_RE = re.compile(r"^\s*[./?]\s*member\s*stats?\b[\s,:;-]*(?P<who>.*)$", re.I | re.S)
 _stats_cooldown = {}
 
 
+def win_rate_value(w: int, l: int) -> float:
+    """Win rate 0.00 - 100.00 (%): wins / (wins + losses) x 100."""
+    return (w / (w + l) * 100) if (w + l) else 0.0
+
+
 def win_rate_text(w: int, l: int) -> str:
-    """Win rate on a 00.00 - 10.00 scale: wins / (wins + losses) x 10."""
-    return f"{(w / (w + l) * 10) if (w + l) else 0.0:05.2f}"
-
-
-def win_rate_bar(w: int, l: int) -> str:
-    filled = round((w / (w + l) * 10) if (w + l) else 0)
-    return "▰" * filled + "▱" * (10 - filled)
+    return f"{win_rate_value(w, l):05.2f}%"      # 00.00% ... 100.00%
 
 
 def overall_rows():
@@ -4831,55 +4829,64 @@ def stats_for(uid: int, view: str):
     return info if info else (None, 0, 0, None)
 
 
-def stats_embed(user, view: str) -> discord.Embed:
-    name = getattr(user, "display_name", None) or getattr(user, "global_name", None) or user.name
-    rank, w, l, top = stats_for(user.id, view)
-    title = {"overall": "Overall Stats", "duel": "Duel Stats", "spar": "Spar Stats"}[view]
-    embed = discord.Embed(title=name, description=f"### {title}", colour=STATS_BLACK)
-    embed.set_thumbnail(url=user.display_avatar.url)
-    embed.add_field(name="Rank", value=f"`#{rank}`" if rank else "`Unranked`", inline=True)
-    embed.add_field(name="Top", value=f"`{top:.2f}%`" if top is not None else "`--`", inline=True)
-    embed.add_field(name="Matches", value=f"`{w + l}`", inline=True)
-    embed.add_field(name="Wins", value=f"`{w}`", inline=True)
-    embed.add_field(name="Losses", value=f"`{l}`", inline=True)
-    embed.add_field(name="Win Rate", value=f"`{win_rate_text(w, l)}` / 10.00\n{win_rate_bar(w, l)}", inline=True)
-    if view == "overall":
-        for mode in LB_MODES:
-            _, mw, ml, _ = stats_for(user.id, mode)
-            embed.add_field(name=MODES[mode]["name"], value=f"`{mw}`W  `{ml}`L  -  `{win_rate_text(mw, ml)}`", inline=True)
-    embed.set_footer(text="Rivalz | Global all-time leaderboard")
-    return embed
-
-
-class StatsView(discord.ui.View):
-    """Overall / Duel / Spar switch under the stats embed. Only the person who asked can switch it."""
-    LABELS = {"overall": "Overall", "duel": "Duel", "spar": "Spar"}
+class StatsView(discord.ui.LayoutView):
+    """Member stats card. Overall by default; the Duel / Spar buttons switch it (press the active one again to go back).
+    Only the person who asked can use the buttons."""
+    TITLES = {"overall": "Member Statistics", "duel": "Duel Statistics", "spar": "Spar Statistics"}
 
     def __init__(self, asker_id: int, user, current: str = "overall"):
         super().__init__(timeout=300)
         self.asker_id, self.user, self.current, self.message = asker_id, user, current, None
         self._paint()
 
-    def _paint(self):
+    def _paint(self, disabled: bool = False):
         self.clear_items()
-        for key in STATS_VIEWS:
-            btn = discord.ui.Button(label=self.LABELS[key], custom_id=f"stats:{key}",
+        user = self.user
+        name = getattr(user, "display_name", None) or getattr(user, "global_name", None) or user.name
+        rank, w, l, top = stats_for(user.id, self.current)
+
+        head = discord.ui.TextDisplay(f"# {self.TITLES[self.current]}\nStats for **{md(name)}**")
+        body = [
+            f"**User:** <@{user.id}>",
+            f"**Rank:** `#{rank}`" if rank else "**Rank:** `Unranked`",
+            f"**Top:** `{top:.2f}%`" if top is not None else "**Top:** `--`",
+            f"**Matches:** `{w + l}`",
+            f"**Wins:** `{w}`",
+            f"**Losses:** `{l}`",
+            f"**Win Rate:** `{win_rate_text(w, l)}`",
+        ]
+        container = discord.ui.Container(accent_colour=STATS_BLACK)
+        container.add_item(discord.ui.Section(head, discord.ui.TextDisplay("\n".join(body)),
+                                              accessory=discord.ui.Thumbnail(user.display_avatar.url)))
+        if self.current == "overall":
+            lines = []
+            for mode in LB_MODES:
+                _, mw, ml, _ = stats_for(user.id, mode)
+                lines.append(f"**{MODES[mode]['name']}:** `{mw}`W  `{ml}`L  -  `{win_rate_text(mw, ml)}`")
+            container.add_item(discord.ui.Separator())
+            container.add_item(discord.ui.TextDisplay("\n".join(lines)))
+        container.add_item(discord.ui.Separator())
+        container.add_item(discord.ui.TextDisplay("-# Rivalz | Global all-time leaderboard"))
+        row = discord.ui.ActionRow()
+        for key in ("duel", "spar"):
+            btn = discord.ui.Button(label=MODES[key]["name"], custom_id=f"stats:{key}", disabled=disabled,
                                     style=discord.ButtonStyle.primary if key == self.current else discord.ButtonStyle.secondary)
             btn.callback = self._make(key)
-            self.add_item(btn)
+            row.add_item(btn)
+        container.add_item(row)
+        self.add_item(container)
 
     def _make(self, key):
         async def callback(interaction: discord.Interaction):
             if interaction.user.id != self.asker_id:
-                return await interaction.response.send_message("Run `/check stats` yourself to use these buttons.", ephemeral=True)
-            self.current = key
+                return await interaction.response.send_message("Run `/member stats` yourself to use these buttons.", ephemeral=True)
+            self.current = "overall" if self.current == key else key
             self._paint()
-            await interaction.response.edit_message(embed=stats_embed(self.user, key), view=self)
+            await interaction.response.edit_message(view=self)
         return callback
 
     async def on_timeout(self):
-        for item in self.children:
-            item.disabled = True
+        self._paint(disabled=True)
         try:
             if self.message:
                 await self.message.edit(view=self)
@@ -4887,24 +4894,24 @@ class StatsView(discord.ui.View):
             pass
 
 
-check_group = app_commands.Group(name="check", description="Look at stats.")
+member_group = app_commands.Group(name="member", description="Member tools.")
 
 
-@check_group.command(name="stats", description="See Overall, Duel and Spar stats of yourself or any member.")
+@member_group.command(name="stats", description="See Overall stats (plus Duel and Spar) of yourself or any member.")
 @app_commands.describe(member="Whose stats to show (default: you)")
-async def check_stats_cmd(interaction: discord.Interaction, member: discord.User = None):
+async def member_stats_cmd(interaction: discord.Interaction, member: discord.User = None):
     await interaction.response.defer()
     target = member or interaction.user
     view = StatsView(interaction.user.id, target)
-    view.message = await interaction.followup.send(embed=stats_embed(target, "overall"), view=view, wait=True)
+    view.message = await interaction.followup.send(view=view, wait=True, allowed_mentions=discord.AllowedMentions.none())
 
 
-bot.tree.add_command(check_group)
+bot.tree.add_command(member_group)
 
 
-async def check_stats_text(message: discord.Message):
-    """.check stats  /check stats  ?check stats  [@member | member id | reply to someone]"""
-    m = CHECK_STATS_RE.match(message.content or "")
+async def member_stats_text(message: discord.Message):
+    """.member stats  ?member stats  [@member | member id | reply to someone]"""
+    m = MEMBER_STATS_RE.match(message.content or "")
     if not m:
         return
     now = time.time()
@@ -4934,7 +4941,7 @@ async def check_stats_text(message: discord.Message):
         else:
             target = message.author
     view = StatsView(message.author.id, target)
-    view.message = await message.reply(embed=stats_embed(target, "overall"), view=view, mention_author=False)
+    view.message = await message.reply(view=view, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
 
 
 set_group = app_commands.Group(name="set", description="Developer only: leaderboard tools.")
