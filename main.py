@@ -1,8 +1,3 @@
-import subprocess, sys
-try:
-    import discord
-except ModuleNotFoundError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "discord.py>=2.6,<3.0", "python-dotenv>=1.0,<2.0"])
 """Piro: universal role-based division MVP tracker with in-ticket live tracking.
 
 Needs: discord.py >= 2.6 (Components V2) and python-dotenv.
