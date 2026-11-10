@@ -8,6 +8,21 @@ The art data lives in `piro_modules/assets.py`.
 URA-only configuration is read from .env. Piro creates no channels or voice rooms; it adds
 one tracker card to an existing Crusher ticket after Crusher's first post.
 """
+import subprocess
+import sys
+
+# Railway sometimes skips the build-time `pip install`. If discord.py is missing, install it now and continue.
+try:
+    import discord  # noqa: F401
+    import dotenv  # noqa: F401
+except ModuleNotFoundError:
+    _pkgs = ["discord.py>=2.6,<3.0", "python-dotenv>=1.0,<2.0"]
+    _base = [sys.executable, "-m", "pip", "install", "--no-input", "--disable-pip-version-check", *_pkgs]
+    try:
+        subprocess.check_call(_base)
+    except subprocess.CalledProcessError:
+        subprocess.check_call(_base + ["--break-system-packages"])
+
 import ast
 import asyncio
 import base64
@@ -341,6 +356,3 @@ if GUILD_ID:
 if not TOKEN or TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
     raise RuntimeError("Set your Discord bot token in .env before starting the bot.")
 bot.run(TOKEN)
-
-
-
