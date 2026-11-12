@@ -3196,13 +3196,12 @@ PANEL_MODES = (
     "**Duel** `Competitive` A match with a winner and a loser.\n"
     "**Spar** `Practice` Warm up and train together.\n"
     "**Format** `First to` Pick first to 1, 3, 5 or your own number. The first player to reach it wins."
-)
-PANEL_HOW = (
+SUGGESTION_HOW = (
     "### How it works\n"
-    "> `1` Pick **Duel** or **Spar** below\n"
-    "> `2` Enter your username, rival, first to (rounds) and server link\n"
-    "> `3` Your rival accepts in their DMs\n"
-    "> `4` Fight, add scores and finish"
+    "> `1` Choose **Submit a Suggestion** from the menu below\n"
+    "> `2` Enter a title and describe your suggestion\n"
+    "> `3` It is sent privately to the developer\n"
+    "> `4` Changed your mind? Choose **Edit My Suggestion**"
 )
 
 
@@ -3297,16 +3296,126 @@ SUGGESTION_NOTES = (
 )
 
 
-def suggestion_dm_view(user, guild, title: str, text: str):
+def suggestion_dm_view(user, guild, title: str, text: str, edited_at=None):
     where = f"{md(guild.name)} (`{guild.id}`)" if guild else "Direct message"
-    return build_card("New Suggestion", [
+    meta = [f"> **From:** {user.mention} (`@{esc(user.name)}`)",
+            f"> **User ID:** `{user.id}`",
+            f"> **Server:** {where}",
+            f"> **Sent:** <t:{int(time.time())}:F>"]
+    if edited_at:
+        meta.append(f"> **Edited:** <t:{int(edited_at)}:F>")
+    return build_card("Suggestion (Edited)" if edited_at else "New Suggestion", [
         [f"**{md(title)}**"],
         [text],
-        [f"> **From:** {user.mention} (`@{esc(user.name)}`)",
-         f"> **User ID:** `{user.id}`",
-         f"> **Server:** {where}",
-         f"> **Sent:** <t:{int(time.time())}:F>"],
+        meta,
     ], accent=GREEN)
+
+
+class SuggestionModal(discord.ui.Modal):
+    def __init__(self, prev: dict = None):
+        super().__init__(title="Edit Suggestion" if prev else "Suggestions", timeout=900)
+        self.prev = prev
+        self.title_in = discord.ui.TextInput(placeholder="A short title for your suggestion",
+                                             default=(prev or {}).get("title") or None,
+                                             min_length=3, max_length=100)
+        self.add_item(discord.ui.Label(text="Title", component=self.title_in))
+        self.text_in = discord.ui.TextInput(style=discord.TextStyle.paragraph,
+                                            placeholder="Describe your suggestion in as much detail as you like",
+                                            default=(prev or {}).get("text") or None,
+                                            min_length=10, max_length=1500)
+        self.add_item(discord.ui.Label(text="Suggestions", component=self.text_in))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        user = interaction.user
+        if not OWNER_ID:
+            return await notice(interaction, "Not Sent", "> Suggestions are not set up yet. Please try again later.")
+        title, text = self.title_in.value.strip(), self.text_in.value.strip()
+        saved = store.d.setdefault("suggestions", {})
+
+        # ---------- edit my suggestion
+        if self.prev:
+            rec = saved.get(str(user.id))
+            if not rec:
+                return await notice(interaction, "Nothing To Edit", "> You have not sent a suggestion yet.", accent=GREY)
+            rec["title"], rec["text"], rec["edited"] = title, text, int(time.time())
+            view = suggestion_dm_view(user, interaction.guild, title, text, edited_at=rec["edited"])
+            done = False
+            try:
+                dm = bot.get_partial_messageable(rec["dm_channel_id"], type=discord.ChannelType.private)
+                await dm.get_partial_message(rec["dm_message_id"]).edit(view=view)
+                done = True
+            except Exception as exc:
+                print(f"Could not edit the suggestion DM, sending a new one: {exc!r}")
+            if not done:  # the old DM is gone: send the edited one as a new message
+                try:
+                    owner = bot.get_user(OWNER_ID) or await bot.fetch_user(OWNER_ID)
+                    msg = await owner.send(view=view)
+                    rec["dm_channel_id"], rec["dm_message_id"] = msg.channel.id, msg.id
+                except Exception as exc:
+                    print(f"Could not DM the edited suggestion: {exc!r}")
+                    return await notice(interaction, "Not Saved", "> Your edit could not be delivered right now. Please try again later.")
+            store.save()
+            return await interaction.followup.send(view=build_card(
+                "Suggestion Updated",
+                [["> Your suggestion was edited and the developer's copy was updated."]], accent=GREEN), ephemeral=True)
+
+        # ---------- new suggestion
+        now = time.time()
+        if not is_owner(user) and now - SUGGESTION_LAST.get(user.id, 0) < SUGGESTION_COOLDOWN:
+            wait = int(SUGGESTION_COOLDOWN - (now - SUGGESTION_LAST.get(user.id, 0))) + 1
+            return await notice(interaction, "Please Wait", f"> You can send another suggestion in `{wait}` seconds.", accent=GREY)
+        view = suggestion_dm_view(user, interaction.guild, title, text)
+        try:
+            owner = bot.get_user(OWNER_ID) or await bot.fetch_user(OWNER_ID)
+            msg = await owner.send(view=view)   # only the developer receives it, nobody else can see it
+        except Exception as exc:
+            print(f"Could not DM a suggestion to the developer: {exc!r}")
+            return await notice(interaction, "Not Sent", "> Your suggestion could not be delivered right now. Please try again later.")
+        SUGGESTION_LAST[user.id] = now
+        saved[str(user.id)] = {"title": title, "text": text, "sent": int(now), "edited": 0,
+                               "dm_channel_id": msg.channel.id, "dm_message_id": msg.id}
+        store.save()
+        await interaction.followup.send(view=build_card(
+            "Suggestion Sent",
+            [["> Thank you. Your suggestion was sent privately to the developer.",
+              "> You can change it any time with **Edit My Suggestion** in the menu."]], accent=GREEN), ephemeral=True)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        await safe_reply(interaction, "Something went wrong. Please try again.")
+        print(f"SuggestionModal error: {error!r}")
+
+
+class SuggestionSelect(discord.ui.Select):
+    def __init__(self):
+        super().__init__(
+            custom_id="rv:suggest",
+            placeholder="Select an option...",
+            options=[
+                discord.SelectOption(label="Submit a Suggestion", value="suggest",
+                                     description="Share an idea or improvement privately."),
+                discord.SelectOption(label="Edit My Suggestion", value="edit",
+                                     description="Change the suggestion you sent before."),
+            ],
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not await guard(interaction):
+            return
+        choice = self.values[0]
+        if choice == "edit":
+            rec = (store.d.get("suggestions") or {}).get(str(interaction.user.id))
+            if not rec:
+                await notice(interaction, "Nothing To Edit",
+                             "> You have not sent a suggestion yet. Choose **Submit a Suggestion** first.", accent=GREY)
+            else:
+                await interaction.response.send_modal(SuggestionModal(prev=rec))
+        else:
+            await interaction.response.send_modal(SuggestionModal())
+        try:  # reset the menu so the same option can be picked again
+            await interaction.message.edit(view=SuggestionPanelView())
+        except discord.HTTPException:
+            pass
 
 
 class SuggestionModal(discord.ui.Modal):
@@ -3650,7 +3759,7 @@ def lb_font(weight: str, size: int):
 
 LB_W = 1000
 LB_PODIUM = 3   # the top 3 are shown on the podium (page 1 only)
-LB_FIRST = 16   # page 1 holds ranks 1 to 16 (podium 1-3 + list 4-16)
+LB_FIRST = 15   # page 1 = podium (1-3) + list (4-15) = 15 members
 LB_PAGE = 10    # every page after the first holds 10 members
 LB_PERIODS = {"day": "Daily", "week": "Weekly", "all": "All-time"}
 C_CARD, C_CARD_LINE = (17, 38, 46), (31, 100, 112)
@@ -3714,8 +3823,7 @@ LB_OUT_W = 400  # finished picture width in pixels; fits a narrow Discord window
 
 
 def _shrink(im):
-    from PIL import Image
-    return im.resize((LB_OUT_W, max(1, round(im.height * LB_OUT_W / im.width))), Image.LANCZOS)
+    return im   # no resizing: more rows just make the picture taller
 
 
 def render_podium(mode_name, period_label, podium, avatars):
