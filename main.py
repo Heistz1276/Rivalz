@@ -3196,7 +3196,8 @@ PANEL_MODES = (
     "**Duel** `Competitive` A match with a winner and a loser.\n"
     "**Spar** `Practice` Warm up and train together.\n"
     "**Format** `First to` Pick first to 1, 3, 5 or your own number. The first player to reach it wins."
-SUGGESTION_HOW = (
+)
+PANEL_HOW = (
     "### How it works\n"
     "> `1` Choose **Submit a Suggestion** from the menu below\n"
     "> `2` Enter a title and describe your suggestion\n"
