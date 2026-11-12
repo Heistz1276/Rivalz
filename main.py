@@ -1305,9 +1305,9 @@ async def create_ticket(guild: discord.Guild, ch, number=None):
             guild.me: discord.PermissionOverwrite(view_channel=True, connect=True, speak=True, manage_channels=True),
         }
         for mem in members:
-            voice_ow[mem] = discord.PermissionOverwrite(view_channel=True, connect=True, speak=True, stream=True)
+            voice_ow[mem] = discord.PermissionOverwrite(view_channel=True, connect=True, speak=True)
         if staff_role:
-            voice_ow[staff_role] = discord.PermissionOverwrite(view_channel=True, connect=True, speak=True, stream=True)
+            voice_ow[staff_role] = discord.PermissionOverwrite(view_channel=True, connect=True, speak=True)
         vc = await guild.create_voice_channel(vc_name, category=category, overwrites=voice_ow,
                                               reason=f"Rivalz {m['name']} voice channel")
     except discord.HTTPException as exc:
@@ -1727,9 +1727,8 @@ def spectator_overwrite(upload=False):
 
 
 def spectator_voice_overwrite():
-    """Spectators can join the ticket voice channel, talk and stream (screen share / camera) in it."""
-    return safe_overwrite(view_channel=True, connect=True, speak=True, stream=True,
-                          use_voice_activation=True, use_embedded_activities=False)
+    return safe_overwrite(view_channel=True, connect=True, speak=False, stream=False,
+                          use_voice_activation=False, use_embedded_activities=False)
 
 
 async def member_of(guild, uid: int):
@@ -1797,7 +1796,7 @@ async def ensure_ticket_access(guild, t):
         await put(channel, m, discord.PermissionOverwrite(view_channel=True, send_messages=True,
                                                           read_message_history=True, attach_files=True))
         if vc:
-            await put(vc, m, discord.PermissionOverwrite(view_channel=True, connect=True, speak=True, stream=True))
+            await put(vc, m, discord.PermissionOverwrite(view_channel=True, connect=True, speak=True))
     for s in spec_list(t):
         m = await member_of(guild, s["discord_id"])
         if not m:
@@ -3199,10 +3198,10 @@ PANEL_MODES = (
 )
 PANEL_HOW = (
     "### How it works\n"
-    "> `1` Choose **Submit a Suggestion** from the menu below\n"
-    "> `2` Enter a title and describe your suggestion\n"
-    "> `3` It is sent privately to the developer\n"
-    "> `4` Changed your mind? Choose **Edit My Suggestion**"
+    "> `1` Pick **Duel** or **Spar** below\n"
+    "> `2` Enter your username, rival, first to (rounds) and server link\n"
+    "> `3` Your rival accepts in their DMs\n"
+    "> `4` Fight, add scores and finish"
 )
 
 
@@ -3275,223 +3274,6 @@ class PanelView(discord.ui.LayoutView):
         self.add_item(c)
 
 
-# ============================================================ Suggestions panel
-SUGGESTION_COOLDOWN = 60      # seconds between two suggestions from the same member (the developer is exempt)
-SUGGESTION_LAST = {}
-
-SUGGESTION_INTRO = (
-    "### We value your experience\n"
-    "> Your voice helps us improve. Share an idea, an improvement or anything you would like to see changed."
-)
-SUGGESTION_HOW = (
-    "### How it works\n"
-    "> `1` Choose **Submit a Suggestion** from the menu below\n"
-    "> `2` Enter a title and describe your suggestion\n"
-    "> `3` It is sent privately to the developer"
-)
-SUGGESTION_NOTES = (
-    "### Good to know\n"
-    "> Your suggestion is private. Only the developer can read it.\n"
-    "> Every suggestion is read and carefully considered.\n"
-    "> Please keep it clear, honest and respectful."
-)
-
-
-def suggestion_dm_view(user, guild, title: str, text: str, edited_at=None):
-    where = f"{md(guild.name)} (`{guild.id}`)" if guild else "Direct message"
-    meta = [f"> **From:** {user.mention} (`@{esc(user.name)}`)",
-            f"> **User ID:** `{user.id}`",
-            f"> **Server:** {where}",
-            f"> **Sent:** <t:{int(time.time())}:F>"]
-    if edited_at:
-        meta.append(f"> **Edited:** <t:{int(edited_at)}:F>")
-    return build_card("Suggestion (Edited)" if edited_at else "New Suggestion", [
-        [f"**{md(title)}**"],
-        [text],
-        meta,
-    ], accent=GREEN)
-
-
-class SuggestionModal(discord.ui.Modal):
-    def __init__(self, prev: dict = None):
-        super().__init__(title="Edit Suggestion" if prev else "Suggestions", timeout=900)
-        self.prev = prev
-        self.title_in = discord.ui.TextInput(placeholder="A short title for your suggestion",
-                                             default=(prev or {}).get("title") or None,
-                                             min_length=3, max_length=100)
-        self.add_item(discord.ui.Label(text="Title", component=self.title_in))
-        self.text_in = discord.ui.TextInput(style=discord.TextStyle.paragraph,
-                                            placeholder="Describe your suggestion in as much detail as you like",
-                                            default=(prev or {}).get("text") or None,
-                                            min_length=10, max_length=1500)
-        self.add_item(discord.ui.Label(text="Suggestions", component=self.text_in))
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        user = interaction.user
-        if not OWNER_ID:
-            return await notice(interaction, "Not Sent", "> Suggestions are not set up yet. Please try again later.")
-        title, text = self.title_in.value.strip(), self.text_in.value.strip()
-        saved = store.d.setdefault("suggestions", {})
-
-        # ---------- edit my suggestion
-        if self.prev:
-            rec = saved.get(str(user.id))
-            if not rec:
-                return await notice(interaction, "Nothing To Edit", "> You have not sent a suggestion yet.", accent=GREY)
-            rec["title"], rec["text"], rec["edited"] = title, text, int(time.time())
-            view = suggestion_dm_view(user, interaction.guild, title, text, edited_at=rec["edited"])
-            done = False
-            try:
-                dm = bot.get_partial_messageable(rec["dm_channel_id"], type=discord.ChannelType.private)
-                await dm.get_partial_message(rec["dm_message_id"]).edit(view=view)
-                done = True
-            except Exception as exc:
-                print(f"Could not edit the suggestion DM, sending a new one: {exc!r}")
-            if not done:  # the old DM is gone: send the edited one as a new message
-                try:
-                    owner = bot.get_user(OWNER_ID) or await bot.fetch_user(OWNER_ID)
-                    msg = await owner.send(view=view)
-                    rec["dm_channel_id"], rec["dm_message_id"] = msg.channel.id, msg.id
-                except Exception as exc:
-                    print(f"Could not DM the edited suggestion: {exc!r}")
-                    return await notice(interaction, "Not Saved", "> Your edit could not be delivered right now. Please try again later.")
-            store.save()
-            return await interaction.followup.send(view=build_card(
-                "Suggestion Updated",
-                [["> Your suggestion was edited and the developer's copy was updated."]], accent=GREEN), ephemeral=True)
-
-        # ---------- new suggestion
-        now = time.time()
-        if not is_owner(user) and now - SUGGESTION_LAST.get(user.id, 0) < SUGGESTION_COOLDOWN:
-            wait = int(SUGGESTION_COOLDOWN - (now - SUGGESTION_LAST.get(user.id, 0))) + 1
-            return await notice(interaction, "Please Wait", f"> You can send another suggestion in `{wait}` seconds.", accent=GREY)
-        view = suggestion_dm_view(user, interaction.guild, title, text)
-        try:
-            owner = bot.get_user(OWNER_ID) or await bot.fetch_user(OWNER_ID)
-            msg = await owner.send(view=view)   # only the developer receives it, nobody else can see it
-        except Exception as exc:
-            print(f"Could not DM a suggestion to the developer: {exc!r}")
-            return await notice(interaction, "Not Sent", "> Your suggestion could not be delivered right now. Please try again later.")
-        SUGGESTION_LAST[user.id] = now
-        saved[str(user.id)] = {"title": title, "text": text, "sent": int(now), "edited": 0,
-                               "dm_channel_id": msg.channel.id, "dm_message_id": msg.id}
-        store.save()
-        await interaction.followup.send(view=build_card(
-            "Suggestion Sent",
-            [["> Thank you. Your suggestion was sent privately to the developer.",
-              "> You can change it any time with **Edit My Suggestion** in the menu."]], accent=GREEN), ephemeral=True)
-
-    async def on_error(self, interaction: discord.Interaction, error: Exception):
-        await safe_reply(interaction, "Something went wrong. Please try again.")
-        print(f"SuggestionModal error: {error!r}")
-
-
-class SuggestionSelect(discord.ui.Select):
-    def __init__(self):
-        super().__init__(
-            custom_id="rv:suggest",
-            placeholder="Select an option...",
-            options=[
-                discord.SelectOption(label="Submit a Suggestion", value="suggest",
-                                     description="Share an idea or improvement privately."),
-                discord.SelectOption(label="Edit My Suggestion", value="edit",
-                                     description="Change the suggestion you sent before."),
-            ],
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        if not await guard(interaction):
-            return
-        choice = self.values[0]
-        if choice == "edit":
-            rec = (store.d.get("suggestions") or {}).get(str(interaction.user.id))
-            if not rec:
-                await notice(interaction, "Nothing To Edit",
-                             "> You have not sent a suggestion yet. Choose **Submit a Suggestion** first.", accent=GREY)
-            else:
-                await interaction.response.send_modal(SuggestionModal(prev=rec))
-        else:
-            await interaction.response.send_modal(SuggestionModal())
-        try:  # reset the menu so the same option can be picked again
-            await interaction.message.edit(view=SuggestionPanelView())
-        except discord.HTTPException:
-            pass
-
-
-class SuggestionModal(discord.ui.Modal):
-    def __init__(self):
-        super().__init__(title="Suggestions", timeout=900)
-        self.title_in = discord.ui.TextInput(placeholder="A short title for your suggestion",
-                                             min_length=3, max_length=100)
-        self.add_item(discord.ui.Label(text="Title", component=self.title_in))
-        self.text_in = discord.ui.TextInput(style=discord.TextStyle.paragraph,
-                                            placeholder="Describe your suggestion in as much detail as you like",
-                                            min_length=10, max_length=1500)
-        self.add_item(discord.ui.Label(text="Suggestions", component=self.text_in))
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        user = interaction.user
-        if not OWNER_ID:
-            return await notice(interaction, "Not Sent", "> Suggestions are not set up yet. Please try again later.")
-        now = time.time()
-        if not is_owner(user) and now - SUGGESTION_LAST.get(user.id, 0) < SUGGESTION_COOLDOWN:
-            wait = int(SUGGESTION_COOLDOWN - (now - SUGGESTION_LAST.get(user.id, 0))) + 1
-            return await notice(interaction, "Please Wait", f"> You can send another suggestion in `{wait}` seconds.", accent=GREY)
-        view = suggestion_dm_view(user, interaction.guild, self.title_in.value.strip(), self.text_in.value.strip())
-        try:
-            owner = bot.get_user(OWNER_ID) or await bot.fetch_user(OWNER_ID)
-            await owner.send(view=view)   # only the developer receives it, nobody else can see it
-        except Exception as exc:
-            print(f"Could not DM a suggestion to the developer: {exc!r}")
-            return await notice(interaction, "Not Sent", "> Your suggestion could not be delivered right now. Please try again later.")
-        SUGGESTION_LAST[user.id] = now
-        await interaction.followup.send(view=build_card(
-            "Suggestion Sent",
-            [["> Thank you. Your suggestion was sent privately to the developer.",
-              "> We appreciate you taking the time to share it."]], accent=GREEN), ephemeral=True)
-
-    async def on_error(self, interaction: discord.Interaction, error: Exception):
-        await safe_reply(interaction, "Something went wrong. Please try again.")
-        print(f"SuggestionModal error: {error!r}")
-
-
-class SuggestionSelect(discord.ui.Select):
-    def __init__(self):
-        super().__init__(
-            custom_id="rv:suggest",
-            placeholder="Select an option...",
-            options=[discord.SelectOption(label="Submit a Suggestion", value="suggest",
-                                          description="Share an idea or improvement privately.")],
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        if not await guard(interaction):
-            return
-        await interaction.response.send_modal(SuggestionModal())
-        try:  # reset the menu so the same option can be picked again
-            await interaction.message.edit(view=SuggestionPanelView())
-        except discord.HTTPException:
-            pass
-
-
-class SuggestionPanelView(discord.ui.LayoutView):
-    def __init__(self):
-        super().__init__(timeout=None)
-        c = discord.ui.Container()
-        c.add_item(discord.ui.TextDisplay("## Suggestions"))
-        c.add_item(discord.ui.TextDisplay(SUGGESTION_INTRO))
-        c.add_item(discord.ui.Separator())
-        c.add_item(discord.ui.TextDisplay(SUGGESTION_HOW))
-        c.add_item(discord.ui.Separator())
-        c.add_item(discord.ui.TextDisplay(SUGGESTION_NOTES))
-        row = discord.ui.ActionRow()
-        row.add_item(SuggestionSelect())
-        c.add_item(row)
-        self.add_item(c)
-
-
 # ============================================================ bot
 class GuardedTree(app_commands.CommandTree):
     """Every slash command is owner only, except /ping (it works for everyone, in any server)."""
@@ -3537,11 +3319,6 @@ class Rivalz(commands.Bot):
         self.roblox = RobloxClient(self.session)
         self.add_dynamic_items(ChallengeButton, TicketButton, ReopenButton, OpenGankButton, LbButton, LbPage, LbSelect,
                                SpectateButton, LogSpectatorsButton, RemoveSpectatorButton)
-        for persistent in (PanelView, SuggestionPanelView):   # the panels' menus and buttons keep working after a restart
-            try:
-                self.add_view(persistent())
-            except Exception as exc:
-                print(f"Could not register {persistent.__name__}: {exc!r}")
         await self.tree.sync()
         expiry_loop.start()
 
@@ -3759,9 +3536,7 @@ def lb_font(weight: str, size: int):
 
 
 LB_W = 1000
-LB_PODIUM = 3   # the top 3 are shown on the podium (page 1 only)
-LB_FIRST = 15   # page 1 = podium (1-3) + list (4-15) = 15 members
-LB_PAGE = 10    # every page after the first holds 10 members
+LB_PAGE = 10  # fighters per page (page 1 = podium + ranks 4 to 10)
 LB_PERIODS = {"day": "Daily", "week": "Weekly", "all": "All-time"}
 C_CARD, C_CARD_LINE = (17, 38, 46), (31, 100, 112)
 C_PANEL, C_ROW, C_ROW_LINE = (18, 53, 64), (22, 38, 46), (42, 68, 82)
@@ -3824,7 +3599,8 @@ LB_OUT_W = 400  # finished picture width in pixels; fits a narrow Discord window
 
 
 def _shrink(im):
-    return im   # no resizing: more rows just make the picture taller
+    from PIL import Image
+    return im.resize((LB_OUT_W, max(1, round(im.height * LB_OUT_W / im.width))), Image.LANCZOS)
 
 
 def render_podium(mode_name, period_label, podium, avatars):
@@ -4190,31 +3966,22 @@ async def lookup_user(uid):
     return name, data
 
 
-def lb_page_count(total: int) -> int:
-    return 1 if total <= LB_FIRST else 1 + -(-(total - LB_FIRST) // LB_PAGE)
-
-
-def lb_page_of_rank(rank: int) -> int:
-    """The leaderboard page a given rank sits on (page 1 = ranks 1-16, then 10 per page)."""
-    return 1 if rank <= LB_FIRST else 2 + (rank - LB_FIRST - 1) // LB_PAGE
-
-
 def page_slice(rows, page):
-    """(page, pages, podium_rows, list_rows) with global ranks attached. Page 1 = the top 3 on the podium + ranks 4-16,
-    every page after that = the next 10 ranks as a list."""
-    pages = lb_page_count(len(rows))
+    """(page, pages, podium_rows, list_rows) with global ranks attached. Page 1 = ranks 1-10 (podium + 4-10),
+    page 2+ = the next 10 ranks as a list."""
+    pages = max(1, -(-len(rows) // LB_PAGE))
     page = min(max(1, page), pages)
     if page == 1:
-        podium = [(i + 1, r) for i, r in enumerate(rows[:LB_PODIUM])]
-        listed = [(i + LB_PODIUM + 1, r) for i, r in enumerate(rows[LB_PODIUM:LB_FIRST])]
+        podium = [(i + 1, r) for i, r in enumerate(rows[:3])]
+        listed = [(i + 4, r) for i, r in enumerate(rows[3:LB_PAGE])]
     else:
-        start = LB_FIRST + (page - 2) * LB_PAGE
+        start = (page - 1) * LB_PAGE
         podium = []
         listed = [(start + i + 1, r) for i, r in enumerate(rows[start:start + LB_PAGE])]
     return page, pages, podium, listed
 
 
-async def board_message(guild, mode, period, page=1, note=None, private=False):
+async def board_message(guild, mode, period, page=1):
     """Builds the whole leaderboard message: the layout plus its pictures. The board is global (all servers)."""
     rows = standings(mode, period)
     page, pages, podium_rows, list_rows = page_slice(rows, page)
@@ -4234,7 +4001,7 @@ async def board_message(guild, mode, period, page=1, note=None, private=False):
     entries = [entry(rk, r) for rk, r in list_rows]
     if entries:
         files.append(discord.File(io.BytesIO(await asyncio.to_thread(render_list, entries, avatars)), filename="list.png"))
-    return lb_layout(guild, mode, period, page == 1, bool(entries), page, pages, note=note, private=private), files
+    return lb_layout(guild, mode, period, page == 1, bool(entries), page, pages), files
 
 
 # ============================================================ leaderboard message: dropdown (with My Rank), pages
@@ -4247,7 +4014,6 @@ class LbSelect(discord.ui.DynamicItem[discord.ui.Select], template=r"rv:lbsel:(?
                 discord.SelectOption(label="All-time Leaderboard", value="all", description="Every win ever recorded.", default=period == "all"),
                 discord.SelectOption(label="Weekly Leaderboard", value="week", description="Wins since Monday (UTC).", default=period == "week"),
                 discord.SelectOption(label="Daily Leaderboard", value="day", description="Wins since midnight (UTC).", default=period == "day"),
-                discord.SelectOption(label="Open my-rank", value="myrank", description="Open the page where your position is (only you see it)."),
             ]))
         self.mode = mode
         self.page = page
@@ -4266,10 +4032,6 @@ class LbSelect(discord.ui.DynamicItem[discord.ui.Select], template=r"rv:lbsel:(?
         values = (interaction.data or {}).get("values") or []
         choice = values[0] if values else "all"
         cfg = gcfg(interaction.guild.id)
-        if choice == "myrank":   # private: the shared board is not touched
-            await interaction.response.defer(ephemeral=True)
-            period = cfg["lb_period"].get(self.mode, "all")
-            return await open_my_rank(interaction, self.mode, period)
         await interaction.response.defer()
         period = choice if choice in LB_PERIODS else "all"
         cfg["lb_period"][self.mode] = period
@@ -4338,15 +4100,14 @@ def page_row(mode, page, pages):
     return row
 
 
-def lb_layout(guild, mode, period, has_podium, has_list, page=1, pages=1, note=None, private=False):
+def lb_layout(guild, mode, period, has_podium, has_list, page=1, pages=1):
     m = MODES[mode]
     view = discord.ui.LayoutView(timeout=None)
     c = discord.ui.Container(accent_colour=m["colour"])
-    if not private:   # the private my-rank view has no dropdown, so it can never change the shared board settings
-        row = discord.ui.ActionRow()
-        row.add_item(LbSelect(mode, period, page))
-        c.add_item(row)
-    where = f"Top {LB_FIRST}" if pages == 1 else f"Page {page}/{pages}"
+    row = discord.ui.ActionRow()
+    row.add_item(LbSelect(mode, period, page))
+    c.add_item(row)
+    where = f"Top {LB_PAGE}" if pages == 1 else f"Page {page}/{pages}"
     intro = discord.ui.TextDisplay(
         f"Leaderboard for the number of **{m['name']}** wins.\n-# Showing {LB_PERIODS[period]} | {where}")
     try:
@@ -4357,8 +4118,6 @@ def lb_layout(guild, mode, period, has_podium, has_list, page=1, pages=1, note=N
         r2.add_item(LbButton(mode))
         c.add_item(r2)
     c.add_item(discord.ui.TextDisplay(f"**Server:** {md(guild.name)}"))
-    if note:
-        c.add_item(discord.ui.TextDisplay(note))
     c.add_item(discord.ui.Separator())
     if has_podium:
         top = discord.ui.MediaGallery()
@@ -4377,23 +4136,6 @@ def lb_layout(guild, mode, period, has_podium, has_list, page=1, pages=1, note=N
         c.add_item(page_row(mode, page, pages))
     view.add_item(c)
     return view
-
-
-async def open_my_rank(interaction: discord.Interaction, mode: str, period: str):
-    """'Open my-rank' (dropdown option): a private copy of the board, opened on the page that holds the member's position.
-    The interaction is already deferred. Only the member sees it; the public board is not touched."""
-    m = MODES[mode]
-    rows = standings(mode, period)
-    info = rank_info(rows, interaction.user.id)
-    if not info:
-        return await notice(interaction, "Not Ranked Yet",
-                            [f"> You are not on the {LB_PERIODS[period]} {m['name']} leaderboard yet.",
-                             f"> Win a {m['name']} to get a position."], accent=GREY)
-    rank = info[0]
-    page = lb_page_of_rank(rank)
-    note = f"-# Your position: **#{rank}** of {len(rows)} | {info[1]}W {info[2]}L | Top {info[3]:.2f}%"
-    view, files = await board_message(interaction.guild, mode, period, page, note=note, private=True)
-    await interaction.followup.send(view=view, files=files, ephemeral=True)
 
 
 async def send_my_rank(interaction: discord.Interaction, mode: str, period: str):
@@ -4679,23 +4421,6 @@ async def panel(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     ok = await post_panel(interaction.guild)
     await interaction.followup.send("Panel reposted." if ok else "Could not post the panel. Run /build first.", ephemeral=True)
-
-
-@bot.tree.command(name="suggestions", description="Owner only: post the Suggestions panel in this channel (or another channel).")
-@app_commands.guild_only()
-@app_commands.describe(channel="Where to post the panel (default: this channel)")
-async def suggestions_panel_cmd(interaction: discord.Interaction, channel: discord.TextChannel = None):
-    if not is_owner(interaction.user):
-        return await interaction.response.send_message("Owner only.", ephemeral=True)
-    target = channel or interaction.channel
-    await interaction.response.defer(ephemeral=True)
-    try:
-        await target.send(view=SuggestionPanelView())
-    except discord.HTTPException as exc:
-        print(f"Could not post the suggestions panel: {exc!r}")
-        return await interaction.followup.send(
-            f"Could not post in {target.mention}. Give the bot View Channel and Send Messages there.", ephemeral=True)
-    await interaction.followup.send(f"Suggestions panel posted in {target.mention}.", ephemeral=True)
 
 
 @bot.tree.command(name="authorize", description="Owner only: authorize Rivalz to be used in this server.")
@@ -5046,7 +4771,7 @@ async def help_cmd(interaction: discord.Interaction):
         ["`/ping` - check that Rivalz is online (everyone)",
          "`/member stats [member]` - Overall stats with Duel and Spar buttons. Also `.member stats`, `?member stats` (everyone)",
          "`/set count d`, `/set count s` - set a player's leaderboard count (developer only)",
-         "`/rank`, `/panel`, `/suggestions`, `/authorize`, `/build`, `/update`, `/backup`, `/deauthorize` ... - owner only"],
+         "`/rank`, `/panel`, `/authorize`, `/build`, `/update`, `/backup`, `/deauthorize` ... - owner only"],
         ["> You can also start a message with **R** or **Rivalz**: `R ping`, `R leaderboard`, `R top 3`, `R rank`, `R open general`, "
          "`R open Divisions category`, `R channels`.",
          "> Developer and trusted users: `R update`, `R panel`, `R build`, `R authorize`, `R backup`, `R db`, `R deauthorize`. "
