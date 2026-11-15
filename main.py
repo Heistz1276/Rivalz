@@ -85,6 +85,7 @@ LEGACY = {
     "duel_lb": 1568637988164862133, "spar_lb": 1568637960855879680,
     "cat_main": 1568343167437115423, "cat_tickets": 1568527718419664927,
     "ongoing": 1568968016493027328, "ongoing_role": 1568968211083567195,
+    "streaks": 1570471881520451795,
 }
 
 EXPIRY_MINUTES = env_int("CHALLENGE_EXPIRY_MINUTES", 30)
@@ -1354,6 +1355,10 @@ async def process_accept(ch, rival, prof):
         print(f"Ticket creation failed: {exc!r}")
         return None, exc
 
+    try:   # a fighter on a streak: tell the streaks channel it is on the line
+        asyncio.create_task(announce_on_the_line(t))
+    except Exception as exc:
+        print(f"Streak on the line task error: {exc!r}")
     m = MODES[ch["mode"]]
     await edit_dm(ch, build_card(
         "Challenge Accepted",
@@ -2109,6 +2114,9 @@ def adopt_legacy_extras(guild) -> bool:
     if not g["ch"].get("ongoing") and guild.get_channel(LEGACY["ongoing"]):
         g["ch"]["ongoing"] = LEGACY["ongoing"]
         changed = True
+    if not g["ch"].get("streaks") and guild.get_channel(LEGACY["streaks"]):   # your original server's streak channel
+        g["ch"]["streaks"] = LEGACY["streaks"]
+        changed = True
     if not g["role"].get("ongoing") and guild.get_role(LEGACY["ongoing_role"]):
         g["role"]["ongoing"] = LEGACY["ongoing_role"]
         changed = True
@@ -2218,6 +2226,7 @@ OPEN_MISS = ("I looked everywhere, there is no channel like that that you can se
 
 CMD_PING = re.compile(r"^(?:ping|pong|latency|status|are you (?:online|up|alive|there))$")
 CMD_HELP = re.compile(r"^(?:help|commands|what can you do)$")
+CMD_STREAK = re.compile(r"^(?:my\s+|win\s+)?streaks?\b(?:\s+.*)?$|^what(?:'s| is) my streak$")
 CMD_RANK = re.compile(r"^(?:my\s+)?(?:rank|stats?)\b(?:\s+.*)?$|^what(?:'s| is) my rank$")
 CMD_LB = re.compile(
     r"^(?:(?:show|check|see|get|view|what(?:'s| is)|whats)\s+(?:me\s+)?(?:the\s+)?)?"
@@ -2314,6 +2323,7 @@ def help_view():
         ["`R ping` - check that Rivalz is online",
          "`R leaderboard` / `R top 3` / `R who is top 1` - current standings (add `duel`, `spar`, `weekly`, `daily`)",
          "`R rank` or `R rank @user` - Duel and Spar rank",
+         "`R streak` or `R streak @user` - current win streak, best streak and the server record",
          "`R open general` - posts the channel link and a button that jumps straight to it (short names work, like `ann`)",
          "`R open Divisions category` - lists every channel in that category",
          "`R channels` / `R channels in <category>` - list the channels you can see"],
@@ -2525,6 +2535,8 @@ async def rivalz_text(message):
         kind = "trust_add"
     elif CMD_OWNER.match(text):
         kind = "owner"
+    elif CMD_STREAK.match(text):
+        kind = "streak"
     elif CMD_RANK.match(text):
         kind = "rank"
     elif CMD_LB.match(text):
@@ -2550,6 +2562,10 @@ async def rivalz_text(message):
         return await message.reply(view=ping_view(api_ms), mention_author=False, allowed_mentions=NO_PING)
     if kind == "help":
         return await message.reply(view=help_view(), mention_author=False, allowed_mentions=NO_PING)
+    if kind == "streak":
+        target = target_of(message)
+        return await message.reply(view=streak_card(target or uid, mention=bool(target and target != uid)),
+                                   mention_author=False, allowed_mentions=NO_PING)
     if kind == "rank":
         target = target_of(message)
         return await message.reply(view=rank_view(target or uid, mention=bool(target and target != uid)),
@@ -3281,7 +3297,7 @@ class GuardedTree(app_commands.CommandTree):
         if is_owner(interaction.user):
             return True
         cmd = interaction.command
-        if cmd is not None and cmd.qualified_name in ("ping", "member stats"):     # /ping and /member stats work for everyone
+        if cmd is not None and cmd.qualified_name in ("ping", "member stats", "streak"):     # /ping, /member stats and /streak work for everyone
             return True
         await safe_reply(interaction, "Owner only.")
         return False
@@ -3296,7 +3312,7 @@ def migrate_legacy():
             continue
         g = gcfg(guild.id)
         g["authorized"], g["legacy"] = True, True
-        for key in ("panel", "log", "results", "duel_lb", "spar_lb"):
+        for key in ("panel", "log", "results", "duel_lb", "spar_lb", "streaks"):
             if guild.get_channel(LEGACY[key]):
                 g["ch"][key] = LEGACY[key]
         g["cat"].update(main=LEGACY["cat_main"], tickets=LEGACY["cat_tickets"])
@@ -3317,7 +3333,7 @@ class Rivalz(commands.Bot):
     async def setup_hook(self):
         self.session = aiohttp.ClientSession()
         self.roblox = RobloxClient(self.session)
-        self.add_dynamic_items(ChallengeButton, TicketButton, ReopenButton, OpenGankButton, LbButton, LbPage, LbSelect,
+        self.add_dynamic_items(ChallengeButton, TicketButton, ReopenButton, OpenGankButton, LbButton, LbPage, LbSelect, LbJump,
                                SpectateButton, LogSpectatorsButton, RemoveSpectatorButton)
         await self.tree.sync()
         expiry_loop.start()
@@ -3659,7 +3675,9 @@ def render_list(entries, avatars):
     d.rounded_rectangle((20, 0, LB_W - 20, H - 4), radius=34, fill=C_CARD + (255,), outline=C_CARD_LINE, width=3)
     y = 22
     for e in entries:
-        d.rounded_rectangle((50, y, LB_W - 50, y + row_h), radius=24, fill=C_ROW, outline=C_ROW_LINE, width=2)
+        hl = e.get("hl")   # the row of the member who pressed My Rank
+        d.rounded_rectangle((50, y, LB_W - 50, y + row_h), radius=24, fill=(26, 66, 78) if hl else C_ROW,
+                            outline=C_GOLD if hl else C_ROW_LINE, width=4 if hl else 2)
         d.text((100, y + row_h / 2), str(e["rank"]), font=lb_font("bold", 32), fill=C_TEXT, anchor="mm")
         av = _rounded_avatar(avatars.get(e["uid"]), 62, 14, e.get("name", "?"))
         im.alpha_composite(av, (146, y + 11))
@@ -3813,9 +3831,227 @@ def record_match(t) -> bool:
     if not row:
         return False
     unrecord_match(row["g"], row["m"], row["n"])  # never count one ticket twice
+    try:
+        before = streak_table(row["m"]) if row["m"] in STREAK_MODES else None   # streaks WITHOUT this match
+    except Exception as exc:
+        print(f"Streak table error: {exc!r}")
+        before = None
     lbstore.d["matches"].append(row)
     lbstore.save()
+    if before is not None:
+        queue_streak_events(row, before)
     return True
+
+
+# ============================================================ win streaks
+# A streak = decided matches won in a row without a loss (Duel by default, set STREAK_MODES=duel,spar for both).
+# Nothing extra is stored: every streak is replayed from the saved matches, so the leaderboard data is never touched
+# and streaks that already exist in your history count straight away.
+#   * announcements at STREAK_MIN (10), then every STREAK_STEP (5): 10, 15, 20, 25 ...
+#   * beating a member who is on a streak (STREAK_MIN+) ends it: they go back to 0 and the winner gets
+#     STREAK_BREAK_BONUS (2) streak for that win, NOT the loser's whole streak.
+STREAK_MIN = max(2, env_int("STREAK_MIN", 10))
+STREAK_STEP = max(1, env_int("STREAK_STEP", 5))
+STREAK_BREAK_BONUS = max(1, env_int("STREAK_BREAK_BONUS", 2))
+STREAK_MODES = tuple(m for m in re.findall(r"[a-z]+", os.getenv("STREAK_MODES", "duel").lower()) if m in LB_MODES) or ("duel",)
+STREAK_STYLES = {
+    "line": ("STREAK ON THE LINE", 0xE74C3C),
+    "one": ("ONE WIN AWAY", 0xF1C40F),
+    "best": ("NEW PERSONAL BEST", 0x1ABC9C),
+    "record": ("SERVER RECORD", 0x9B59B6),
+    "milestone": ("STREAK MILESTONE", 0xE67E22),
+    "ended": ("STREAK ENDED", 0x95A5A6),
+}
+
+
+def streak_table(mode, matches=None):
+    """Replay every decided match of one mode, oldest first.
+    -> {user_id: {cur, best, prev_best, start, victim}}  (best = longest ever, prev_best = best before the current run)"""
+    rows = sorted((x for x in (lbstore.d["matches"] if matches is None else matches) if x["m"] == mode),
+                  key=lambda x: (x["ts"], x["n"]))
+    users = {}
+
+    def get(uid):
+        return users.setdefault(uid, {"cur": 0, "best": 0, "prev_best": 0, "start": 0, "victim": None})
+
+    for x in rows:
+        w, l = get(x["w"]), get(x["l"])
+        gain = STREAK_BREAK_BONUS if l["cur"] >= STREAK_MIN else 1
+        l["cur"] = 0                                    # a loss always sends the streak back to 0
+        if w["cur"] == 0:
+            w["start"], w["prev_best"] = x["ts"], w["best"]
+        w["cur"] += gain
+        w["best"] = max(w["best"], w["cur"])
+        w["victim"] = x["l"]
+    return users
+
+
+def next_milestone(n: int) -> int:
+    if n < STREAK_MIN:
+        return STREAK_MIN
+    return STREAK_MIN + ((n - STREAK_MIN) // STREAK_STEP + 1) * STREAK_STEP
+
+
+def streak_events(row, before, after):
+    """What happened to the streaks because of this one match. before/after = streak_table() without/with it."""
+    w, l = row["w"], row["l"]
+    out = []
+    bl = before.get(l)
+    if bl and bl["cur"] >= STREAK_MIN:
+        out.append({"kind": "ended", "n": bl["cur"], "winner": w, "loser": l, "lasted": row["ts"] - bl["start"]})
+    b = (before.get(w) or {}).get("cur", 0)
+    aw = after.get(w)
+    if aw:
+        a = aw["cur"]
+        crossed = [k for k in range(STREAK_MIN, a + 1, STREAK_STEP) if k > b]
+        if crossed:
+            n = max(crossed)
+            rec_n, rec_u = max(((u["best"], uid) for uid, u in before.items()), default=(0, None))
+            if n > rec_n:
+                out.append({"kind": "record", "n": n, "user": w, "prev": rec_n, "holder": rec_u})
+            elif n > aw["prev_best"]:
+                out.append({"kind": "best", "n": n, "user": w, "prev": aw["prev_best"]})
+            else:
+                out.append({"kind": "milestone", "n": n, "user": w, "victim": l})
+        else:
+            nxt = next_milestone(a)
+            if nxt - a == 1 and a > b:
+                out.append({"kind": "one", "n": a, "next": nxt, "user": w, "victim": l})
+    return out
+
+
+def queue_streak_events(row, before):
+    try:
+        events = streak_events(row, before, streak_table(row["m"]))
+        if events:
+            asyncio.get_running_loop().create_task(post_streak_events(row["g"], row["m"], events))
+    except Exception as exc:
+        print(f"Streak events error: {exc!r}")
+
+
+def fmt_span(seconds) -> str:
+    seconds = max(0, int(seconds))
+    d, r = divmod(seconds, 86400)
+    h, r = divmod(r, 3600)
+    if d:
+        return f"{d} day{'s' if d != 1 else ''}"
+    if h:
+        return f"{h} hour{'s' if h != 1 else ''}"
+    m = max(1, r // 60)
+    return f"{m} minute{'s' if m != 1 else ''}"
+
+
+def render_badge(number, colour: int) -> bytes:
+    """The hexagon with the streak number (like the mock-up), drawn big and shrunk for smooth edges."""
+    from PIL import Image, ImageDraw
+    rgb = ((colour >> 16) & 255, (colour >> 8) & 255, colour & 255)
+    S, OUT = 640, 160
+    im = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    cx = cy = S / 2
+    r = S * 0.46
+    pts = [(cx + r * math.cos(math.radians(60 * i - 90)), cy + r * math.sin(math.radians(60 * i - 90))) for i in range(6)]
+    d.polygon(pts, fill=tuple(int(c * 0.2) + 16 for c in rgb) + (255,))
+    d.line(pts + [pts[0]], fill=rgb + (255,), width=26, joint="curve")
+    txt = str(number)
+    size = 300 if len(txt) <= 2 else 230
+    d.text((cx, cy + 6), txt, font=lb_font("bold", size), fill=rgb + (255,), anchor="mm")
+    out = io.BytesIO()
+    im.resize((OUT, OUT), Image.LANCZOS).save(out, "PNG")
+    return out.getvalue()
+
+
+async def send_streak_card(gid, kind, number, main, small, mode=None):
+    title, colour = STREAK_STYLES[kind]
+    if mode and len(STREAK_MODES) > 1:
+        small += f" · {MODES[mode]['name']}"
+    png = await asyncio.to_thread(render_badge, number, colour)
+    view = discord.ui.LayoutView(timeout=None)
+    c = discord.ui.Container(accent_colour=colour)
+    flame = "" if kind == "ended" else "🔥 "
+    c.add_item(discord.ui.Section(discord.ui.TextDisplay(f"### {flame}{title}\n{main}\n-# {small}"),
+                                  accessory=discord.ui.Thumbnail("attachment://streak.png")))
+    view.add_item(c)
+    return await send_cfg(gid, "streaks", view, file=discord.File(io.BytesIO(png), filename="streak.png"))
+
+
+def wins_text(n) -> str:
+    return f"{n} win{'s' if n != 1 else ''}"
+
+
+async def post_streak_events(gid, mode, events):
+    for ev in events:
+        try:
+            k, n = ev["kind"], ev["n"]
+            if k == "ended":
+                await send_streak_card(
+                    gid, k, n, f"<@{ev['winner']}> ended <@{ev['loser']}>'s {n}-win streak.",
+                    f"Final streak: {wins_text(n)} · Lasted {fmt_span(ev['lasted'])} · Ended by <@{ev['winner']}> "
+                    f"· +{STREAK_BREAK_BONUS} streak", mode)
+            elif k == "record":
+                prev = f"{wins_text(ev['prev'])}" + (f", held by <@{ev['holder']}>" if ev["holder"] and ev["holder"] != ev["user"] else "") \
+                    if ev["prev"] else "none yet"
+                await send_streak_card(gid, k, n, f"<@{ev['user']}> now holds the longest streak in Rivalz.",
+                                       f"{wins_text(n)} · Previous record: {prev}", mode)
+            elif k == "best":
+                prev = wins_text(ev["prev"]) if ev["prev"] else "none"
+                await send_streak_card(gid, k, n, f"<@{ev['user']}> just set a new personal best: {n} wins in a row.",
+                                       f"Previous best: {prev} · The streak is still going", mode)
+            elif k == "milestone":
+                await send_streak_card(gid, k, n, f"<@{ev['user']}> is on a {n}-win streak.",
+                                       f"Keep it going · Last victim: <@{ev['victim']}>", mode)
+            elif k == "one":
+                await send_streak_card(gid, k, n, f"<@{ev['user']}> is on {n} wins. One more reaches a {ev['next']}-win streak.",
+                                       f"Their next match decides it · Last victim: <@{ev['victim']}>", mode)
+        except Exception as exc:
+            print(f"Could not post a streak card: {exc!r}")
+        await asyncio.sleep(1)
+
+
+async def announce_on_the_line(t):
+    """A match was just accepted: if one of the two fighters is on a streak, say it is on the line."""
+    try:
+        mode = t["mode"]
+        if mode not in STREAK_MODES:
+            return
+        table = streak_table(mode)
+        p0, p1 = t["p"][0]["discord_id"], t["p"][1]["discord_id"]   # p0 challenged, p1 accepted
+        for holder, other in ((p0, p1), (p1, p0)):
+            n = (table.get(holder) or {}).get("cur", 0)
+            if n < STREAK_MIN:
+                continue
+            if holder == p0:
+                main = f"<@{p1}> has accepted a match against <@{p0}>."
+            else:
+                main = f"<@{p1}> accepted a challenge from <@{p0}>."
+            await send_streak_card(t["guild_id"], "line", n, main,
+                                   f"<@{holder}> is on a {n}-win streak. If <@{other}> wins, the run ends here.", mode)
+    except Exception as exc:
+        print(f"Streak on the line error: {exc!r}")
+
+
+def streak_card(uid: int, modes=None, mention: bool = False):
+    sections = []
+    if mention:
+        sections.append([f"> <@{uid}>"])
+    for mode in (modes or STREAK_MODES):
+        table = streak_table(mode)
+        me = table.get(uid) or {"cur": 0, "best": 0, "victim": None, "start": 0}
+        rec_n, rec_u = max(((u["best"], x) for x, u in table.items()), default=(0, None))
+        cur = me["cur"]
+        nxt = next_milestone(cur)
+        lines = [f"**{MODES[mode]['name']}**",
+                 f"> **Current streak:** {wins_text(cur)}" + (" 🔥" if cur >= STREAK_MIN else ""),
+                 f"> **Best streak:** {wins_text(me['best'])}",
+                 f"> **Next milestone:** {nxt} wins ({nxt - cur} to go)"]
+        if cur >= STREAK_MIN:
+            lines.append(f"> On the line: whoever beats <@{uid}> ends it and gets +{STREAK_BREAK_BONUS} streak.")
+        if cur and me["victim"]:
+            lines.append(f"> **Last victim:** <@{me['victim']}>")
+        if rec_n:
+            lines.append(f"> **Server record:** {wins_text(rec_n)}" + (f" by <@{rec_u}>" if rec_u else ""))
+        sections.append(lines)
+    return build_card("Streak Status", sections, accent=0xE67E22)
 
 
 def backfill_matches():
@@ -3981,7 +4217,7 @@ def page_slice(rows, page):
     return page, pages, podium, listed
 
 
-async def board_message(guild, mode, period, page=1):
+async def board_message(guild, mode, period, page=1, highlight=None):
     """Builds the whole leaderboard message: the layout plus its pictures. The board is global (all servers)."""
     rows = standings(mode, period)
     page, pages, podium_rows, list_rows = page_slice(rows, page)
@@ -3991,7 +4227,8 @@ async def board_message(guild, mode, period, page=1):
     avatars = {u: f[1] for u, f in zip(ids, found) if f[1]}
 
     def entry(rank, r):
-        return {"rank": rank, "uid": r[0], "name": names.get(r[0], "unknown"), "w": r[1], "l": r[2]}
+        return {"rank": rank, "uid": r[0], "name": names.get(r[0], "unknown"), "w": r[1], "l": r[2],
+                "hl": highlight is not None and r[0] == highlight}
 
     files = []
     if page == 1:
@@ -4056,11 +4293,23 @@ class LbButton(discord.ui.DynamicItem[discord.ui.Button], template=r"rv:lbme:(?P
         print(f"LbButton error: {error!r}")
 
     async def callback(self, interaction: discord.Interaction):
+        """My Rank now JUMPS the board to the page the member is on (their row is highlighted)."""
         if not interaction.guild or not await guard(interaction):
             return
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer()
         period = gcfg(interaction.guild.id)["lb_period"].get(self.mode, "all")
-        await send_my_rank(interaction, self.mode, period)
+        info = rank_info(standings(self.mode, period), interaction.user.id)
+        if not info:   # not on this board: the private card explains it, the board stays where it is
+            return await send_my_rank(interaction, self.mode, period)
+        page = (info[0] - 1) // LB_PAGE + 1
+        view, files = await board_message(interaction.guild, self.mode, period, page, highlight=interaction.user.id)
+        await interaction.edit_original_response(view=view, attachments=files)
+        try:
+            await interaction.followup.send(
+                f"You are **#{info[0]}** on the {LB_PERIODS[period]} {MODES[self.mode]['name']} board "
+                f"with **{info[1]}W {info[2]}L** (Top {info[3]:.2f}%). Showing page {page}.", ephemeral=True)
+        except discord.HTTPException:
+            pass
 
 
 class LbPage(discord.ui.DynamicItem[discord.ui.Button], template=r"rv:lbpg:(?P<mode>duel|spar):(?P<page>\d+):(?P<slot>[a-z0-9]+)"):
@@ -4086,6 +4335,50 @@ class LbPage(discord.ui.DynamicItem[discord.ui.Button], template=r"rv:lbpg:(?P<m
         await interaction.response.defer()
         period = gcfg(interaction.guild.id)["lb_period"].get(self.mode, "all")
         view, files = await board_message(interaction.guild, self.mode, period, self.target)
+        await interaction.edit_original_response(view=view, attachments=files)
+
+
+def jump_pages(page, pages):
+    """The page numbers offered in the 'Jump to page' dropdown (Discord allows 25 options), around the current page."""
+    if pages <= 25:
+        return list(range(1, pages + 1))
+    first = min(max(1, page - 12), pages - 24)
+    return list(range(first, first + 25))
+
+
+def page_range_text(n: int) -> str:
+    return f"Ranks 1-{LB_PAGE}" if n == 1 else f"Ranks {(n - 1) * LB_PAGE + 1}-{n * LB_PAGE}"
+
+
+class LbJump(discord.ui.DynamicItem[discord.ui.Select], template=r"rv:lbjump:(?P<mode>duel|spar):(?P<page>\d+)"):
+    """Dropdown under the board: pick any page (1, 2, 3 ...) and go straight there."""
+    def __init__(self, mode, page=1, pages=1):
+        super().__init__(discord.ui.Select(
+            custom_id=f"rv:lbjump:{mode}:{page}", placeholder=f"Jump to page ({page}/{max(pages, page)})",
+            options=[discord.SelectOption(label=f"Page {n}", value=str(n), description=page_range_text(n))
+                     for n in jump_pages(page, max(pages, page))]))
+        self.mode = mode
+        self.page = page
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        return cls(match["mode"], page=int(match["page"]))
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        await safe_reply(interaction, "Something went wrong. Please try again.")
+        print(f"LbJump error: {error!r}")
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.guild or not await guard(interaction):
+            return
+        values = (interaction.data or {}).get("values") or []
+        try:
+            target = int(values[0])
+        except (ValueError, IndexError):
+            target = self.page
+        await interaction.response.defer()
+        period = gcfg(interaction.guild.id)["lb_period"].get(self.mode, "all")
+        view, files = await board_message(interaction.guild, self.mode, period, target)
         await interaction.edit_original_response(view=view, attachments=files)
 
 
@@ -4134,6 +4427,9 @@ def lb_layout(guild, mode, period, has_podium, has_list, page=1, pages=1):
     if pages > 1:
         c.add_item(discord.ui.Separator())
         c.add_item(page_row(mode, page, pages))
+        jump = discord.ui.ActionRow()
+        jump.add_item(LbJump(mode, page, pages))
+        c.add_item(jump)
     view.add_item(c)
     return view
 
@@ -4354,6 +4650,8 @@ async def build_guild(guild):
     # Ongoing-Ping: the channel that announces live matches + the role that gets pinged for them
     adopt_legacy_extras(guild)  # your original server keeps its existing channel and role
     await text("ongoing", "ongoing-ping", main, read_only, "Live Duels and Spars. Join as a spectator to watch.", move=False)
+    # Streak announcements (10, 15, 20 ... wins in a row). Your original server keeps its own streaks channel.
+    await text("streaks", "streaks", main, read_only, "Win streak announcements: 10, 15, 20 wins in a row and every 5 after.", move=False)
     roles = cfg["role"]
     orole = guild.get_role(roles["ongoing"]) if roles.get("ongoing") else None
     if orole:
@@ -4770,6 +5068,7 @@ async def help_cmd(interaction: discord.Interaction):
         [f"> Challenge rivals to a **Duel** or **Spar** from the matchmaking panel. First to the chosen rounds wins."],
         ["`/ping` - check that Rivalz is online (everyone)",
          "`/member stats [member]` - Overall stats with Duel and Spar buttons. Also `.member stats`, `?member stats` (everyone)",
+         "`/streak [member]` - win streak status: current, best, next milestone, server record (everyone)",
          "`/set count d`, `/set count s` - set a player's leaderboard count (developer only)",
          "`/rank`, `/panel`, `/authorize`, `/build`, `/update`, `/backup`, `/deauthorize` ... - owner only"],
         ["> You can also start a message with **R** or **Rivalz**: `R ping`, `R leaderboard`, `R top 3`, `R rank`, `R open general`, "
@@ -4794,6 +5093,17 @@ async def rank_cmd(interaction: discord.Interaction):
         else:
             sections.append([f"**{name}**", "> Unranked. Win a match to get on the board."])
     await interaction.followup.send(view=build_card("Your Rank (All-time)", sections, accent=GREEN), ephemeral=True)
+
+
+@bot.tree.command(name="streak", description="Check a win streak (yours by default): current, best and the server record.")
+@app_commands.describe(member="Whose streak to check (default: you)", mode="Duel or Spar (default: the streak mode)")
+@app_commands.choices(mode=[app_commands.Choice(name="Duel", value="duel"), app_commands.Choice(name="Spar", value="spar")])
+async def streak_cmd(interaction: discord.Interaction, member: discord.User = None, mode: app_commands.Choice[str] = None):
+    target = member or interaction.user
+    await interaction.response.defer()
+    await interaction.followup.send(
+        view=streak_card(target.id, [mode.value] if mode else None, mention=target.id != interaction.user.id),
+        allowed_mentions=NO_PING)
 
 
 # ============================================================ /member stats  (also  .member stats  ?member stats)
