@@ -3844,16 +3844,17 @@ def record_match(t) -> bool:
 
 
 # ============================================================ win streaks
-# A streak = decided matches won in a row without a loss (Duel by default, set STREAK_MODES=duel,spar for both).
+# A streak = decided matches won in a row without a loss. Duel and Spar each have their own streak (STREAK_MODES=duel,spar).
 # Nothing extra is stored: every streak is replayed from the saved matches, so the leaderboard data is never touched
 # and streaks that already exist in your history count straight away.
 #   * announcements at STREAK_MIN (10), then every STREAK_STEP (5): 10, 15, 20, 25 ...
+#   * /set count changes count too: extra wins are added to the streak, extra losses reset it
 #   * beating a member who is on a streak (STREAK_MIN+) ends it: they go back to 0 and the winner gets
 #     STREAK_BREAK_BONUS (2) streak for that win, NOT the loser's whole streak.
 STREAK_MIN = max(2, env_int("STREAK_MIN", 10))
 STREAK_STEP = max(1, env_int("STREAK_STEP", 5))
 STREAK_BREAK_BONUS = max(1, env_int("STREAK_BREAK_BONUS", 2))
-STREAK_MODES = tuple(m for m in re.findall(r"[a-z]+", os.getenv("STREAK_MODES", "duel").lower()) if m in LB_MODES) or ("duel",)
+STREAK_MODES = tuple(m for m in re.findall(r"[a-z]+", os.getenv("STREAK_MODES", "duel,spar").lower()) if m in LB_MODES) or ("duel",)
 STREAK_STYLES = {
     "line": ("STREAK ON THE LINE", 0xE74C3C),
     "one": ("ONE WIN AWAY", 0xF1C40F),
@@ -3867,14 +3868,28 @@ STREAK_STYLES = {
 def streak_table(mode, matches=None):
     """Replay every decided match of one mode, oldest first.
     -> {user_id: {cur, best, prev_best, start, victim}}  (best = longest ever, prev_best = best before the current run)"""
-    rows = sorted((x for x in (lbstore.d["matches"] if matches is None else matches) if x["m"] == mode),
-                  key=lambda x: (x["ts"], x["n"]))
+    timeline = [(x["ts"], x["n"], x) for x in (lbstore.d["matches"] if matches is None else matches) if x["m"] == mode]
+    if matches is None:   # wins / losses added by hand with /set count
+        timeline += [(m["ts"], -1, m) for m in (store.d.get("streak_manual") or []) if m.get("m") == mode]
+    timeline.sort(key=lambda e: (e[0], e[1]))
     users = {}
 
     def get(uid):
         return users.setdefault(uid, {"cur": 0, "best": 0, "prev_best": 0, "start": 0, "victim": None})
 
-    for x in rows:
+    for _ts, _n, x in timeline:
+        if "uid" in x:   # a manual /set count change
+            u = get(x["uid"])
+            if x["dl"] > 0:
+                u["cur"] = 0
+            if x["dw"] > 0:
+                if u["cur"] == 0:
+                    u["start"], u["prev_best"] = x["ts"], u["best"]
+                u["cur"] += x["dw"]
+                u["best"] = max(u["best"], u["cur"])
+            elif x["dw"] < 0 and x["dl"] <= 0:
+                u["cur"] = max(0, u["cur"] + x["dw"])
+            continue
         w, l = get(x["w"]), get(x["l"])
         gain = STREAK_BREAK_BONUS if l["cur"] >= STREAK_MIN else 1
         l["cur"] = 0                                    # a loss always sends the streak back to 0
@@ -3896,7 +3911,7 @@ def streak_events(row, before, after):
     """What happened to the streaks because of this one match. before/after = streak_table() without/with it."""
     w, l = row["w"], row["l"]
     out = []
-    bl = before.get(l)
+    bl = before.get(l) if l is not None else None
     if bl and bl["cur"] >= STREAK_MIN:
         out.append({"kind": "ended", "n": bl["cur"], "winner": w, "loser": l, "lasted": row["ts"] - bl["start"]})
     b = (before.get(w) or {}).get("cur", 0)
@@ -3999,10 +4014,10 @@ async def post_streak_events(gid, mode, events):
                                        f"Previous best: {prev} · The streak is still going", mode)
             elif k == "milestone":
                 await send_streak_card(gid, k, n, f"<@{ev['user']}> is on a {n}-win streak.",
-                                       f"Keep it going · Last victim: <@{ev['victim']}>", mode)
+                                       "Keep it going" + (f" · Last victim: <@{ev['victim']}>" if ev.get("victim") else ""), mode)
             elif k == "one":
                 await send_streak_card(gid, k, n, f"<@{ev['user']}> is on {n} wins. One more reaches a {ev['next']}-win streak.",
-                                       f"Their next match decides it · Last victim: <@{ev['victim']}>", mode)
+                                       "Their next match decides it" + (f" · Last victim: <@{ev['victim']}>" if ev.get("victim") else ""), mode)
         except Exception as exc:
             print(f"Could not post a streak card: {exc!r}")
         await asyncio.sleep(1)
@@ -4030,10 +4045,26 @@ async def announce_on_the_line(t):
         print(f"Streak on the line error: {exc!r}")
 
 
+async def apply_manual_streak(gid, mode, uid, dw, dl):
+    """/set count: extra wins are added to the member's streak, extra losses send it back to 0. Streak cards post
+    like after a real match."""
+    if not dw and not dl:
+        return []
+    now = int(time.time())
+    before = streak_table(mode)
+    store.d.setdefault("streak_manual", []).append({"m": mode, "uid": int(uid), "ts": now, "dw": int(dw), "dl": int(dl)})
+    store.save()
+    after = streak_table(mode)
+    events = streak_events({"w": uid, "l": None, "ts": now}, before, after) if dw > 0 else []
+    if events and gid and mode in STREAK_MODES:
+        asyncio.create_task(post_streak_events(gid, mode, events))
+    return events
+
+
 def streak_card(uid: int, modes=None, mention: bool = False):
-    sections = []
+    blocks = []
     if mention:
-        sections.append([f"> <@{uid}>"])
+        blocks.append(f"<@{uid}>")
     for mode in (modes or STREAK_MODES):
         table = streak_table(mode)
         me = table.get(uid) or {"cur": 0, "best": 0, "victim": None, "start": 0}
@@ -4044,14 +4075,16 @@ def streak_card(uid: int, modes=None, mention: bool = False):
                  f"> **Current streak:** {wins_text(cur)}" + (" 🔥" if cur >= STREAK_MIN else ""),
                  f"> **Best streak:** {wins_text(me['best'])}",
                  f"> **Next milestone:** {nxt} wins ({nxt - cur} to go)"]
-        if cur >= STREAK_MIN:
-            lines.append(f"> On the line: whoever beats <@{uid}> ends it and gets +{STREAK_BREAK_BONUS} streak.")
         if cur and me["victim"]:
             lines.append(f"> **Last victim:** <@{me['victim']}>")
         if rec_n:
             lines.append(f"> **Server record:** {wins_text(rec_n)}" + (f" by <@{rec_u}>" if rec_u else ""))
-        sections.append(lines)
-    return build_card("Streak Status", sections, accent=0xE67E22)
+        blocks.append("\n".join(lines))
+    view = discord.ui.LayoutView(timeout=None)
+    c = discord.ui.Container(accent_colour=0xE67E22)
+    c.add_item(discord.ui.TextDisplay("## Streak Status\n" + "\n\n".join(blocks)))   # one text block, no divider lines
+    view.add_item(c)
+    return view
 
 
 def backfill_matches():
@@ -5183,6 +5216,11 @@ class StatsView(discord.ui.LayoutView):
                                     style=discord.ButtonStyle.primary if key == self.current else discord.ButtonStyle.secondary)
             btn.callback = self._make(key)
             row.add_item(btn)
+        if self.current != "overall":   # Duel / Spar view: a clear way back to the main card
+            back = discord.ui.Button(label="Go Back", custom_id="stats:back", disabled=disabled,
+                                     style=discord.ButtonStyle.danger)
+            back.callback = self._back
+            row.add_item(back)
         container.add_item(row)
         self.add_item(container)
 
@@ -5194,6 +5232,13 @@ class StatsView(discord.ui.LayoutView):
             self._paint()
             await interaction.response.edit_message(view=self)
         return callback
+
+    async def _back(self, interaction: discord.Interaction):
+        if interaction.user.id != self.asker_id:
+            return await interaction.response.send_message("Run `/member stats` yourself to use these buttons.", ephemeral=True)
+        self.current = "overall"
+        self._paint()
+        await interaction.response.edit_message(view=self)
 
     async def on_timeout(self):
         self._paint(disabled=True)
@@ -5264,6 +5309,7 @@ async def set_count(interaction: discord.Interaction, mode: str, user: discord.U
     if wins is None and losses is None:
         return await interaction.response.send_message("Give at least `wins` or `losses`.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
+    prev_w, prev_l = next(((w, l) for u, w, l in standings(mode, "all") if u == user.id), (0, 0))   # what the board shows now
     # what the saved matches already give this player on the all-time board (without any earlier manual change)
     adj = lbstore.d.setdefault("adjust", {}).setdefault(mode, {})
     adj.pop(str(user.id), None)
@@ -5275,8 +5321,14 @@ async def set_count(interaction: discord.Interaction, mode: str, user: discord.U
         adj.pop(str(user.id), None)
     lbstore.save()
     schedule_lb_refresh()
+    try:   # extra wins count as wins in a row (streak cards post), extra losses reset the streak
+        await apply_manual_streak(interaction.guild_id, mode, user.id, new_w - prev_w, new_l - prev_l)
+    except Exception as exc:
+        print(f"Manual streak update failed: {exc!r}")
+    cur_streak = (streak_table(mode).get(user.id) or {}).get("cur", 0)
     await notice(interaction, "Leaderboard Count Set",
                  [f"> **{MODES[mode]['name']}:** {user.mention} is now `{new_w}` wins / `{new_l}` losses (all-time).",
+                  f"> Win streak: `{cur_streak}`. Streak cards post in the streaks channel at {STREAK_MIN}, then every {STREAK_STEP}.",
                   "> The boards refresh in a few seconds. Matches already recorded are kept."], accent=GREEN)
 
 
