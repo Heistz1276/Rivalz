@@ -1,5 +1,5 @@
 """
-Rivalz - Matchmaking bot for Duels and Spars
+Rivalz - Matchmaking bot for Duels
 Requires: discord.py >= 2.6 (Components V2 + modal selects), aiohttp, python-dotenv, Pillow
 Run:      py main.py
 Needs the MESSAGE CONTENT INTENT enabled in the Developer Portal (Bot tab) for the gank image step.
@@ -82,7 +82,7 @@ DEVELOPER_URL = os.getenv("DEVELOPER_URL", "").strip() or (f"https://discord.com
 # setup (see migrate_legacy). Every other server gets its channels from /build.
 LEGACY = {
     "panel": 1568343031294459904, "log": 1568525004164042842, "results": 1568527659334377492,
-    "duel_lb": 1568637988164862133, "spar_lb": 1568637960855879680,
+    "duel_lb": 1568637988164862133,
     "cat_main": 1568343167437115423, "cat_tickets": 1568527718419664927,
     "ongoing": 1568968016493027328, "ongoing_role": 1568968211083567195,
     "streaks": 1570471881520451795,
@@ -95,7 +95,7 @@ GANK_SECONDS = 120
 RIVALZ_COOLDOWN = 3           # seconds between "Rivalz <command>" messages from the same person (the developer is exempt)
 LB_RESET_ID = ""   # leaderboard wipe is DISABLED. Nothing is ever reset or deleted by an update.
 MSG_NOTICE_EVERY = 15         # the "Match Details" card is posted at 15 messages, again at 30 (old one removed), 45, ...
-LB_MODES = ("duel", "spar")
+LB_MODES = ("duel",)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -116,20 +116,20 @@ os.makedirs(DATA_DIR, exist_ok=True)
 EPHEMERAL_DISK = ON_RAILWAY and not (os.getenv("DATA_DIR", "").strip() or VOLUME_DIR)
 DATA_FILE = os.path.join(DATA_DIR, "rivalz_data.json")
 
-MODES = {
+class _Modes(dict):
+    """Duel is the only mode now. A leftover ticket saved as 'spar' is simply treated as a Duel (nothing is deleted)."""
+    def __missing__(self, key):
+        return self["duel"]
+
+
+MODES = _Modes({
     "duel": {
         "name": "Duel",
         "prefix": "clash",
         "taunt": "> Prove who is stronger. Accept to open a private ticket and voice channel.",
         "colour": 0xE74C3C,
     },
-    "spar": {
-        "name": "Spar",
-        "prefix": "warmup",
-        "taunt": "> Warm up and sharpen your skills together. Accept to open a private ticket and voice channel.",
-        "colour": 0x3498DB,
-    },
-}
+})
 GREEN, RED, GREY = 0x2ECC71, 0xE74C3C, 0x95A5A6
 STATUS_TEXT = {"open": "Open", "ended": "Ended", "finished": "Recorded"}
 
@@ -448,7 +448,7 @@ class Store:
                 print(f"Could not read {path}, starting fresh: {exc}")
                 self.d = {}
         self.d.setdefault("counters", {})
-        for mode in ("duel", "spar"):
+        for mode in ("duel",):
             self.d["counters"].setdefault(mode, 0)
         for key in ("challenges", "profiles", "tickets", "archive", "guilds"):
             self.d.setdefault(key, {})
@@ -2286,7 +2286,7 @@ def rank_view(uid: int, mention: bool = False):
 
 def lb_query(text: str):
     """'top 3 duel weekly' / 'who is the best' / 'leaderboard' -> (mode or None, period, how many)."""
-    mode = "duel" if re.search(r"\bduels?\b", text) else "spar" if re.search(r"\bspar(?:s|ring)?\b", text) else None
+    mode = "duel" if re.search(r"\bduels?\b", text) else None
     period = "day" if re.search(r"\b(?:daily|today|day)\b", text) else "week" if re.search(r"\b(?:weekly|week)\b", text) else "all"
     m = re.search(r"\b(?:top|first)\s*#?(\d{1,2})\b", text) or re.search(r"#(\d{1,2})\b", text)
     if m:
@@ -2321,9 +2321,9 @@ def help_view():
     return build_card("Rivalz Commands", [
         ["> Start a message with **R** or **Rivalz** and a command instead of using `/`."],
         ["`R ping` - check that Rivalz is online",
-         "`R leaderboard` / `R top 3` / `R who is top 1` - current standings (add `duel`, `spar`, `weekly`, `daily`)",
-         "`R rank` or `R rank @user` - Duel and Spar rank",
-         "`R streak` or `R streak @user` - current win streak, best streak and the server record",
+         "`R leaderboard` / `R top 3` / `R who is top 1` - current standings (add `weekly` or `daily`)",
+         "`R rank` or `R rank @user` - Duel rank",
+         "`R streak` or `R streak @user` - current win streak, best streak and next milestone",
          "`R open general` - posts the channel link and a button that jumps straight to it (short names work, like `ann`)",
          "`R open Divisions category` - lists every channel in that category",
          "`R channels` / `R channels in <category>` - list the channels you can see"],
@@ -2564,8 +2564,7 @@ async def rivalz_text(message):
         return await message.reply(view=help_view(), mention_author=False, allowed_mentions=NO_PING)
     if kind == "streak":
         target = target_of(message)
-        return await message.reply(view=streak_card(target or uid, mention=bool(target and target != uid)),
-                                   mention_author=False, allowed_mentions=NO_PING)
+        return await message.reply(view=streak_card(target or uid), mention_author=False, allowed_mentions=NO_PING)
     if kind == "rank":
         target = target_of(message)
         return await message.reply(view=rank_view(target or uid, mention=bool(target and target != uid)),
@@ -3197,7 +3196,7 @@ class ConfigModal(discord.ui.Modal):
 
 
 HELP_SECTIONS = [
-    ["> Pick **Duel** or **Spar**, choose a rival and rounds. Your rival accepts in their DMs."],
+    ["> Pick **Duel**, choose a rival and rounds. Your rival accepts in their DMs."],
     ["`1` Select a mode, enter your Roblox username (saved for next time), pick **first to** how many rounds and paste your **server link**.",
      "`2` Your rival presses **Accept** and a private ticket with a voice channel opens.",
      "`3` Fight, then each player adds their own score. First to the chosen rounds wins (first to 5 lasts 9 rounds at most).",
@@ -3206,15 +3205,14 @@ HELP_SECTIONS = [
     ["> **Settings** is optional. Fake challenges or scores lead to a blacklist."],
 ]
 
-PANEL_INTRO = "> Challenge a rival to a **Duel** or train in a **Spar**. Private ticket, voice channel and tracked scores."
+PANEL_INTRO = "> Challenge a rival to a **Duel**. Private ticket, voice channel and tracked scores."
 PANEL_MODES = (
     "**Duel** `Competitive` A match with a winner and a loser.\n"
-    "**Spar** `Practice` Warm up and train together.\n"
     "**Format** `First to` Pick first to 1, 3, 5 or your own number. The first player to reach it wins."
 )
 PANEL_HOW = (
     "### How it works\n"
-    "> `1` Pick **Duel** or **Spar** below\n"
+    "> `1` Pick **Duel** below\n"
     "> `2` Enter your username, rival, first to (rounds) and server link\n"
     "> `3` Your rival accepts in their DMs\n"
     "> `4` Fight, add scores and finish"
@@ -3247,17 +3245,16 @@ class ModeSelect(discord.ui.Select):
     def __init__(self):
         super().__init__(
             custom_id="rv:mode",
-            placeholder="Select a mode...",
+            placeholder="Start a Duel...",
             options=[
                 discord.SelectOption(label="Duel", value="duel", description="Competitive match against a rival you pick."),
-                discord.SelectOption(label="Spar", value="spar", description="Practice round to warm up and train together."),
             ],
         )
 
     async def callback(self, interaction: discord.Interaction):
         if not await guard(interaction):
             return
-        mode = self.values[0]
+        mode = "duel"   # an old panel message may still offer Spar: it always opens a Duel now
         prof = store.d["profiles"].get(str(interaction.user.id), {})
         await interaction.response.send_modal(ChallengeModal(mode, prof))
         try:  # reset the menu so the same mode can be picked again
@@ -3312,7 +3309,7 @@ def migrate_legacy():
             continue
         g = gcfg(guild.id)
         g["authorized"], g["legacy"] = True, True
-        for key in ("panel", "log", "results", "duel_lb", "spar_lb", "streaks"):
+        for key in ("panel", "log", "results", "duel_lb", "streaks"):
             if guild.get_channel(LEGACY[key]):
                 g["ch"][key] = LEGACY[key]
         g["cat"].update(main=LEGACY["cat_main"], tickets=LEGACY["cat_tickets"])
@@ -3844,7 +3841,7 @@ def record_match(t) -> bool:
 
 
 # ============================================================ win streaks
-# A streak = decided matches won in a row without a loss. Duel and Spar each have their own streak (STREAK_MODES=duel,spar).
+# A streak = decided matches won in a row without a loss (Duel).
 # Nothing extra is stored: every streak is replayed from the saved matches, so the leaderboard data is never touched
 # and streaks that already exist in your history count straight away.
 #   * announcements at STREAK_MIN (10), then every STREAK_STEP (5): 10, 15, 20, 25 ...
@@ -3854,7 +3851,7 @@ def record_match(t) -> bool:
 STREAK_MIN = max(2, env_int("STREAK_MIN", 10))
 STREAK_STEP = max(1, env_int("STREAK_STEP", 5))
 STREAK_BREAK_BONUS = max(1, env_int("STREAK_BREAK_BONUS", 2))
-STREAK_MODES = tuple(m for m in re.findall(r"[a-z]+", os.getenv("STREAK_MODES", "duel,spar").lower()) if m in LB_MODES) or ("duel",)
+STREAK_MODES = ("duel",)
 STREAK_STYLES = {
     "line": ("STREAK ON THE LINE", 0xE74C3C),
     "one": ("ONE WIN AWAY", 0xF1C40F),
@@ -3927,7 +3924,7 @@ def streak_events(row, before, after):
             elif n > aw["prev_best"]:
                 out.append({"kind": "best", "n": n, "user": w, "prev": aw["prev_best"]})
             else:
-                out.append({"kind": "milestone", "n": n, "user": w, "victim": l})
+                out.append({"kind": "milestone", "n": n, "user": w, "victim": l, "lasted": row["ts"] - aw["start"]})
         else:
             nxt = next_milestone(a)
             if nxt - a == 1 and a > b:
@@ -3976,15 +3973,132 @@ def render_badge(number, colour: int) -> bytes:
     return out.getvalue()
 
 
-async def send_streak_card(gid, kind, number, main, small, mode=None):
+def render_rosette(number, colour: int) -> bytes:
+    """Award rosette with two ribbons in a flat comic style: scalloped edge, dark outline, offset white shadow."""
+    from PIL import Image, ImageDraw
+    rgb = ((colour >> 16) & 255, (colour >> 8) & 255, colour & 255)
+    ink, paper = (28, 28, 34, 255), (246, 246, 248, 255)
+    S, OUT = 1000, 200
+    im = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    cx, cy = 500, 410
+    scallop = []
+    for i in range(720):
+        t = i * 2 * math.pi / 720
+        rad = 300 + 20 * math.cos(14 * t)
+        scallop.append((cx + rad * math.cos(t), cy + rad * math.sin(t)))
+
+    def tail(sign):   # sign +1 = left ribbon (leans left), -1 = right ribbon
+        a = math.radians(22 * sign)
+        ox, oy = cx - 120 * sign, cy + 200
+        out = []
+        for x, y in ((-70, 0), (70, 0), (70, 340), (0, 285), (-70, 340)):
+            out.append((ox + x * math.cos(a) - y * math.sin(a), oy + x * math.sin(a) + y * math.cos(a)))
+        return out
+
+    def draw(poly, fill, dx=0, dy=0):
+        pts = [(x + dx, y + dy) for x, y in poly]
+        d.polygon(pts, fill=fill)
+        d.line(pts + [pts[0]], fill=ink, width=14, joint="curve")
+
+    for poly in (tail(1), tail(-1), scallop):          # the white offset shadow behind everything
+        draw(poly, paper, 26, 26)
+    for poly in (tail(1), tail(-1), scallop):
+        draw(poly, rgb + (255,))
+    d.ellipse([cx - 225, cy - 225, cx + 225, cy + 225], fill=paper, outline=ink, width=12)
+    d.ellipse([cx - 185, cy - 185, cx + 185, cy + 185], fill=rgb + (255,), outline=ink, width=12)
+    txt = str(number)
+    d.text((cx, cy + 8), txt, font=lb_font("bold", 250 if len(txt) <= 2 else 190), fill=paper, anchor="mm",
+           stroke_width=12, stroke_fill=ink)
+    for sx, sy in ((120, 140), (880, 120), (890, 720), (100, 640)):   # small sparkle bursts
+        for ang in (0, 45, 90, 135):
+            dx, dy = 34 * math.cos(math.radians(ang)), 34 * math.sin(math.radians(ang))
+            d.line([(sx - dx, sy - dy), (sx + dx, sy + dy)], fill=ink, width=8)
+    out = io.BytesIO()
+    im.resize((OUT, OUT), Image.LANCZOS).save(out, "PNG")
+    return out.getvalue()
+
+
+ROSETTE_NUMBERS = (10, 15)   # these milestones use the rosette badge, every other number keeps the hexagon
+
+
+# Every streak card is two lines. Each kind has several texts that carry different information, and the next
+# card never repeats the text that kind used last. (min_n, needed values, text)
+STREAK_TEXTS = {
+    "milestone": [
+        (0, (), "{u} has won {n} matches in a row.\nNobody has been able to stop them yet."),
+        (0, (), "{u} is on a {n}-win streak.\nEvery opponent so far has fallen."),
+        (0, (), "{n} wins and counting for {u}.\nWho is going to be the one to stop them?"),
+        (0, ("nxt",), "{u} keeps on winning, {n} in a row now.\nThe next milestone is {nxt} wins."),
+        (0, ("v",), "{u} just beat {v} to reach {n} wins in a row.\nThe streak keeps growing."),
+        (0, ("v",), "{v} was the latest to fall to {u}.\nThat makes {n} wins without a loss."),
+        (0, ("span",), "{u} has gone {span} without losing.\n{n} wins in a row and still going."),
+        (20, (), "{u} is on a rampage with {n} wins in a row.\nIt is getting hard to see who can stop this."),
+        (30, (), "{n} wins in a row. {u} is dominating Rivalz.\nThis run is turning into history."),
+        (45, (), "{u} has not lost in {n} matches.\nThe whole server is watching this streak."),
+    ],
+    "one": [
+        (0, ("nxt",), "{u} is on {n} wins, one away from a {nxt}-win streak.\nTheir next match decides it."),
+        (0, ("nxt",), "One more win and {u} reaches {nxt} in a row.\nThey are sitting on {n} right now."),
+        (0, ("v", "nxt"), "{u} beat {v} and moved up to {n} wins.\nThe {nxt}-win mark is one match away."),
+        (0, ("nxt",), "{n} wins down for {u}, only one to go.\nCan anyone stop them before {nxt}?"),
+    ],
+    "best": [
+        (0, (), "{u} just set a new personal best with {n} wins in a row.\nAnd the streak is still going."),
+        (0, ("prev",), "{u} passed their own best of {prev} wins.\nThey are now at {n} and still going."),
+        (0, (), "{u} has never won this many in a row before.\n{n} wins and counting."),
+        (0, ("prev",), "The old personal best was {prev} wins.\n{u} just left it behind with {n} in a row."),
+    ],
+    "record": [
+        (0, (), "{u} now holds the longest streak in Rivalz.\n{n} wins in a row, and nobody has gone further."),
+        (0, ("prev",), "New server record: {u} with {n} wins in a row.\nThe old mark of {prev} has been passed."),
+        (0, ("h",), "{u} took the longest streak in Rivalz from {h}.\n{n} wins in a row and the record is theirs now."),
+        (0, (), "{u} is making history with {n} wins in a row.\nNo one in Rivalz has ever gone this far."),
+    ],
+    "ended": [
+        (0, (), "{w} ended {l}'s {n}-win streak.\nThe run is over."),
+        (0, ("span",), "{w} ended {l}'s {n}-win streak.\nIt lasted {span} before it came to an end."),
+        (0, (), "{l}'s run of {n} wins is over.\n{w} was the one who finally stopped it."),
+        (0, (), "{n} wins in a row, and then {w} showed up.\n{l}'s streak has ended."),
+        (0, ("span",), "{w} broke {l}'s streak at {n} wins.\nThat run lasted {span}."),
+    ],
+    "line": [
+        (0, (), "{h} is putting a {n}-win streak on the line against {o}.\nIf {o} wins, the run ends here."),
+        (0, (), "{o} has a chance to end {h}'s {n}-win streak.\nThe match is about to start."),
+        (0, (), "{n} wins in a row for {h}, and now {o} is next.\nThis match could end it."),
+        (0, (), "{o} is coming for {h}'s {n}-win streak.\nOne win and it is over."),
+        (0, ("acc_h",), "{h} accepted a challenge from {o} with a {n}-win streak on the line.\nOne loss ends the whole run."),
+        (0, ("chal_h",), "{h} challenged {o} while on a {n}-win streak.\nIf {o} wins, the streak is over."),
+    ],
+}
+STREAK_LAST = {}
+
+
+def pick_streak_text(kind, **kw) -> str:
+    n = kw.get("n", 0)
+    pool = [t for lo, need, t in STREAK_TEXTS[kind] if n >= lo and all(kw.get(k) for k in need)]
+    fresh = [t for t in pool if t != STREAK_LAST.get(kind)] or pool
+    text = random.choice(fresh)
+    STREAK_LAST[kind] = text
+    return text.format(**{k: ("" if v is None else v) for k, v in kw.items()})
+
+
+def mn(uid):
+    return f"<@{uid}>" if uid else None
+
+
+def span_text(seconds):
+    """A time span worth saying out loud (at least one hour), else None."""
+    return fmt_span(seconds) if seconds is not None and seconds >= 3600 else None
+
+
+async def send_streak_card(gid, kind, number, text):
     title, colour = STREAK_STYLES[kind]
-    if mode and len(STREAK_MODES) > 1:
-        small += f" · {MODES[mode]['name']}"
-    png = await asyncio.to_thread(render_badge, number, colour)
+    make = render_rosette if number in ROSETTE_NUMBERS else render_badge
+    png = await asyncio.to_thread(make, number, colour)
     view = discord.ui.LayoutView(timeout=None)
     c = discord.ui.Container(accent_colour=colour)
-    flame = "" if kind == "ended" else "🔥 "
-    c.add_item(discord.ui.Section(discord.ui.TextDisplay(f"### {flame}{title}\n{main}\n-# {small}"),
+    c.add_item(discord.ui.Section(discord.ui.TextDisplay(f"### {title}\n{text}"),
                                   accessory=discord.ui.Thumbnail("attachment://streak.png")))
     view.add_item(c)
     return await send_cfg(gid, "streaks", view, file=discord.File(io.BytesIO(png), filename="streak.png"))
@@ -3998,26 +4112,19 @@ async def post_streak_events(gid, mode, events):
     for ev in events:
         try:
             k, n = ev["kind"], ev["n"]
+            kw = {"n": n}
             if k == "ended":
-                await send_streak_card(
-                    gid, k, n, f"<@{ev['winner']}> ended <@{ev['loser']}>'s {n}-win streak.",
-                    f"Final streak: {wins_text(n)} · Lasted {fmt_span(ev['lasted'])} · Ended by <@{ev['winner']}> "
-                    f"· +{STREAK_BREAK_BONUS} streak", mode)
+                kw.update(w=mn(ev["winner"]), l=mn(ev["loser"]), span=span_text(ev.get("lasted")))
             elif k == "record":
-                prev = f"{wins_text(ev['prev'])}" + (f", held by <@{ev['holder']}>" if ev["holder"] and ev["holder"] != ev["user"] else "") \
-                    if ev["prev"] else "none yet"
-                await send_streak_card(gid, k, n, f"<@{ev['user']}> now holds the longest streak in Rivalz.",
-                                       f"{wins_text(n)} · Previous record: {prev}", mode)
+                holder = ev["holder"] if ev["holder"] and ev["holder"] != ev["user"] else None
+                kw.update(u=mn(ev["user"]), prev=ev["prev"] or None, h=mn(holder))
             elif k == "best":
-                prev = wins_text(ev["prev"]) if ev["prev"] else "none"
-                await send_streak_card(gid, k, n, f"<@{ev['user']}> just set a new personal best: {n} wins in a row.",
-                                       f"Previous best: {prev} · The streak is still going", mode)
+                kw.update(u=mn(ev["user"]), prev=ev["prev"] or None)
             elif k == "milestone":
-                await send_streak_card(gid, k, n, f"<@{ev['user']}> is on a {n}-win streak.",
-                                       "Keep it going" + (f" · Last victim: <@{ev['victim']}>" if ev.get("victim") else ""), mode)
+                kw.update(u=mn(ev["user"]), v=mn(ev.get("victim")), nxt=next_milestone(n), span=span_text(ev.get("lasted")))
             elif k == "one":
-                await send_streak_card(gid, k, n, f"<@{ev['user']}> is on {n} wins. One more reaches a {ev['next']}-win streak.",
-                                       "Their next match decides it" + (f" · Last victim: <@{ev['victim']}>" if ev.get("victim") else ""), mode)
+                kw.update(u=mn(ev["user"]), nxt=ev["next"], v=mn(ev.get("victim")))
+            await send_streak_card(gid, k, n, pick_streak_text(k, **kw))
         except Exception as exc:
             print(f"Could not post a streak card: {exc!r}")
         await asyncio.sleep(1)
@@ -4035,12 +4142,9 @@ async def announce_on_the_line(t):
             n = (table.get(holder) or {}).get("cur", 0)
             if n < STREAK_MIN:
                 continue
-            if holder == p0:
-                main = f"<@{p1}> has accepted a match against <@{p0}>."
-            else:
-                main = f"<@{p1}> accepted a challenge from <@{p0}>."
-            await send_streak_card(t["guild_id"], "line", n, main,
-                                   f"<@{holder}> is on a {n}-win streak. If <@{other}> wins, the run ends here.", mode)
+            text = pick_streak_text("line", n=n, h=mn(holder), o=mn(other),
+                                    acc_h=(holder == p1) or None, chal_h=(holder == p0) or None)
+            await send_streak_card(t["guild_id"], "line", n, text)
     except Exception as exc:
         print(f"Streak on the line error: {exc!r}")
 
@@ -4061,25 +4165,17 @@ async def apply_manual_streak(gid, mode, uid, dw, dl):
     return events
 
 
-def streak_card(uid: int, modes=None, mention: bool = False):
-    blocks = []
-    if mention:
-        blocks.append(f"<@{uid}>")
+def streak_card(uid: int, modes=None, mention: bool = True):
+    """Streak Status: the member on top, then the Duel streak (current, best, next milestone)."""
+    blocks = [f"> <@{uid}>"]
     for mode in (modes or STREAK_MODES):
-        table = streak_table(mode)
-        me = table.get(uid) or {"cur": 0, "best": 0, "victim": None, "start": 0}
-        rec_n, rec_u = max(((u["best"], x) for x, u in table.items()), default=(0, None))
+        me = streak_table(mode).get(uid) or {"cur": 0, "best": 0}
         cur = me["cur"]
         nxt = next_milestone(cur)
-        lines = [f"**{MODES[mode]['name']}**",
-                 f"> **Current streak:** {wins_text(cur)}" + (" 🔥" if cur >= STREAK_MIN else ""),
-                 f"> **Best streak:** {wins_text(me['best'])}",
-                 f"> **Next milestone:** {nxt} wins ({nxt - cur} to go)"]
-        if cur and me["victim"]:
-            lines.append(f"> **Last victim:** <@{me['victim']}>")
-        if rec_n:
-            lines.append(f"> **Server record:** {wins_text(rec_n)}" + (f" by <@{rec_u}>" if rec_u else ""))
-        blocks.append("\n".join(lines))
+        blocks.append("\n".join([f"**{MODES[mode]['name']}**",
+                                 f"> **Current streak:** {wins_text(cur)}",
+                                 f"> **Best streak:** {wins_text(me['best'])}",
+                                 f"> **Next milestone:** {nxt} wins ({nxt - cur} to go)"]))
     view = discord.ui.LayoutView(timeout=None)
     c = discord.ui.Container(accent_colour=0xE67E22)
     c.add_item(discord.ui.TextDisplay("## Streak Status\n" + "\n\n".join(blocks)))   # one text block, no divider lines
@@ -4128,7 +4224,7 @@ def message_text(components) -> str:
 
 def parse_result(text):
     """A final (closed) result card -> one match row, or None (live cards, draws and 'not recorded' are skipped)."""
-    title = re.search(r"(Duel|Spar) #(\d+) Result", text)
+    title = re.search(r"(Duel) #(\d+) Result", text)
     if not title or "This match is closed" not in text:
         return None
     win = re.search(r"\*\*Winner:\*\* <@!?(\d+)>", text)
@@ -4275,7 +4371,7 @@ async def board_message(guild, mode, period, page=1, highlight=None):
 
 
 # ============================================================ leaderboard message: dropdown (with My Rank), pages
-class LbSelect(discord.ui.DynamicItem[discord.ui.Select], template=r"rv:lbsel:(?P<mode>duel|spar)(?::(?P<page>\d+))?"):
+class LbSelect(discord.ui.DynamicItem[discord.ui.Select], template=r"rv:lbsel:(?P<mode>duel)(?::(?P<page>\d+))?"):
     """The dropdown at the top: Daily / Weekly / All-time."""
     def __init__(self, mode, period="all", page=1):
         super().__init__(discord.ui.Select(
@@ -4310,7 +4406,7 @@ class LbSelect(discord.ui.DynamicItem[discord.ui.Select], template=r"rv:lbsel:(?
         await interaction.edit_original_response(view=view, attachments=files)
 
 
-class LbButton(discord.ui.DynamicItem[discord.ui.Button], template=r"rv:lbme:(?P<mode>duel|spar)"):
+class LbButton(discord.ui.DynamicItem[discord.ui.Button], template=r"rv:lbme:(?P<mode>duel)"):
     """Small My Rank button at the top of the board (answers privately, the board is not touched)."""
     def __init__(self, mode):
         super().__init__(discord.ui.Button(label="My Rank", style=discord.ButtonStyle.secondary,
@@ -4345,7 +4441,7 @@ class LbButton(discord.ui.DynamicItem[discord.ui.Button], template=r"rv:lbme:(?P
             pass
 
 
-class LbPage(discord.ui.DynamicItem[discord.ui.Button], template=r"rv:lbpg:(?P<mode>duel|spar):(?P<page>\d+):(?P<slot>[a-z0-9]+)"):
+class LbPage(discord.ui.DynamicItem[discord.ui.Button], template=r"rv:lbpg:(?P<mode>duel):(?P<page>\d+):(?P<slot>[a-z0-9]+)"):
     """Page buttons under the board: < 1 2 3 >"""
     def __init__(self, mode, target, slot, label=None, current=False, disabled=False):
         super().__init__(discord.ui.Button(
@@ -4383,7 +4479,7 @@ def page_range_text(n: int) -> str:
     return f"Ranks 1-{LB_PAGE}" if n == 1 else f"Ranks {(n - 1) * LB_PAGE + 1}-{n * LB_PAGE}"
 
 
-class LbJump(discord.ui.DynamicItem[discord.ui.Select], template=r"rv:lbjump:(?P<mode>duel|spar):(?P<page>\d+)"):
+class LbJump(discord.ui.DynamicItem[discord.ui.Select], template=r"rv:lbjump:(?P<mode>duel):(?P<page>\d+)"):
     """Dropdown under the board: pick any page (1, 2, 3 ...) and go straight there."""
     def __init__(self, mode, page=1, pages=1):
         super().__init__(discord.ui.Select(
@@ -4492,7 +4588,7 @@ LB_SIG = {}  # what each channel's board last showed, so an unchanged board is n
 
 
 async def refresh_leaderboards(guild, repost=False):
-    """Posts a fresh Duel and Spar board in their channels and removes the previous one. A board that has not
+    """Posts a fresh Duel board in its channel and removes the previous one. A board that has not
     changed since it was last posted is left alone (so there is no pointless delete + repost)."""
     cfg = gcfg(guild.id)
     for mode in LB_MODES:
@@ -4675,14 +4771,13 @@ async def build_guild(guild):
 
     # Category 1: the 5 base channels
     main = await category("main", "RIVALZ", {})
-    await text("panel", "matchmaking", main, read_only, "Start a Duel or Spar from here.")
+    await text("panel", "matchmaking", main, read_only, "Start a Duel from here.")
     await text("results", "results", main, read_only, "Finished match results.")
     await text("log", "match-logs", main, private, "Rivalz ticket logs (staff only).")
     await text("duel_lb", "duel-leaderboard", main, read_only, "Duel leaderboard, ranked by wins.")
-    await text("spar_lb", "spar-leaderboard", main, read_only, "Spar leaderboard, ranked by wins.")
     # Ongoing-Ping: the channel that announces live matches + the role that gets pinged for them
     adopt_legacy_extras(guild)  # your original server keeps its existing channel and role
-    await text("ongoing", "ongoing-ping", main, read_only, "Live Duels and Spars. Join as a spectator to watch.", move=False)
+    await text("ongoing", "ongoing-ping", main, read_only, "Live Duels. Join as a spectator to watch.", move=False)
     # Streak announcements (10, 15, 20 ... wins in a row). Your original server keeps its own streaks channel.
     await text("streaks", "streaks", main, read_only, "Win streak announcements: 10, 15, 20 wins in a row and every 5 after.", move=False)
     roles = cfg["role"]
@@ -4698,7 +4793,7 @@ async def build_guild(guild):
         orole = await guild.create_role(name="Ongoing Ping", mentionable=True, reason="Rivalz /build")
         roles["ongoing"] = orole.id
         created.append(f"Role {orole.mention}")
-    # Category 2: tickets (every Duel/Spar ticket is created in here)
+    # Category 2: tickets (every Duel ticket is created in here)
     await category("tickets", "TICKETS", private)
     # An old LEADERBOARDS category from the previous layout is removed once it is empty
     old_lb = guild.get_channel(cats["lb"]) if cats.get("lb") else None
@@ -5043,21 +5138,20 @@ async def backup_cmd(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="addmatch", description="Owner only: add one past result to the global leaderboard.")
-@app_commands.describe(mode="Duel or Spar", winner="Who won", loser="Who lost", days_ago="How many days ago it happened (default 0)")
-@app_commands.choices(mode=[app_commands.Choice(name="Duel", value="duel"), app_commands.Choice(name="Spar", value="spar")])
-async def addmatch(interaction: discord.Interaction, mode: app_commands.Choice[str], winner: discord.User,
+@app_commands.describe(winner="Who won", loser="Who lost", days_ago="How many days ago it happened (default 0)")
+async def addmatch(interaction: discord.Interaction, winner: discord.User,
                    loser: discord.User, days_ago: app_commands.Range[int, 0, 3650] = 0):
     if not is_owner(interaction.user):
         return await interaction.response.send_message("Owner only.", ephemeral=True)
     if winner.id == loser.id:
         return await notice(interaction, "Invalid", "> The winner and loser must be different people.")
     await interaction.response.defer(ephemeral=True)
-    lbstore.d["matches"].append({"g": interaction.guild_id or 0, "m": mode.value, "n": -int(time.time() * 1000),
+    lbstore.d["matches"].append({"g": interaction.guild_id or 0, "m": "duel", "n": -int(time.time() * 1000),
                                  "ts": int(time.time()) - days_ago * 86400, "w": winner.id, "l": loser.id, "ws": 0, "ls": 0})
     lbstore.save()
     schedule_lb_refresh()
     await notice(interaction, "Match Added",
-                 [f"> **{mode.name}:** {winner.mention} beat {loser.mention}", "> The boards refresh in a few seconds."],
+                 [f"> **Duel:** {winner.mention} beat {loser.mention}", "> The board refreshes in a few seconds."],
                  accent=GREEN)
 
 
@@ -5098,11 +5192,11 @@ async def update_cmd(interaction: discord.Interaction):
 @bot.tree.command(name="help", description="See what Rivalz can do.")
 async def help_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(view=build_card("Rivalz Help", [
-        [f"> Challenge rivals to a **Duel** or **Spar** from the matchmaking panel. First to the chosen rounds wins."],
+        [f"> Challenge rivals to a **Duel** from the matchmaking panel. First to the chosen rounds wins."],
         ["`/ping` - check that Rivalz is online (everyone)",
-         "`/member stats [member]` - Overall stats with Duel and Spar buttons. Also `.member stats`, `?member stats` (everyone)",
-         "`/streak [member]` - win streak status: current, best, next milestone, server record (everyone)",
-         "`/set count d`, `/set count s` - set a player's leaderboard count (developer only)",
+         "`/member stats [member]` - Duel stats of yourself or any member. Also `.member stats`, `?member stats` (everyone)",
+         "`/streak [member]` - win streak status: current, best and next milestone (everyone)",
+         "`/set count d` - set a player's leaderboard count (developer only)",
          "`/rank`, `/panel`, `/authorize`, `/build`, `/update`, `/backup`, `/deauthorize` ... - owner only"],
         ["> You can also start a message with **R** or **Rivalz**: `R ping`, `R leaderboard`, `R top 3`, `R rank`, `R open general`, "
          "`R open Divisions category`, `R channels`.",
@@ -5112,7 +5206,7 @@ async def help_cmd(interaction: discord.Interaction):
     ], accent=GREY), ephemeral=True)
 
 
-@bot.tree.command(name="rank", description="See your global Duel and Spar rank.")
+@bot.tree.command(name="rank", description="See your global Duel rank.")
 async def rank_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     uid = interaction.user.id
@@ -5128,15 +5222,12 @@ async def rank_cmd(interaction: discord.Interaction):
     await interaction.followup.send(view=build_card("Your Rank (All-time)", sections, accent=GREEN), ephemeral=True)
 
 
-@bot.tree.command(name="streak", description="Check a win streak (yours by default): current, best and the server record.")
-@app_commands.describe(member="Whose streak to check (default: you)", mode="Duel or Spar (default: the streak mode)")
-@app_commands.choices(mode=[app_commands.Choice(name="Duel", value="duel"), app_commands.Choice(name="Spar", value="spar")])
-async def streak_cmd(interaction: discord.Interaction, member: discord.User = None, mode: app_commands.Choice[str] = None):
+@bot.tree.command(name="streak", description="Check a win streak (yours by default): current, best and next milestone.")
+@app_commands.describe(member="Whose streak to check (default: you)")
+async def streak_cmd(interaction: discord.Interaction, member: discord.User = None):
     target = member or interaction.user
     await interaction.response.defer()
-    await interaction.followup.send(
-        view=streak_card(target.id, [mode.value] if mode else None, mention=target.id != interaction.user.id),
-        allowed_mentions=NO_PING)
+    await interaction.followup.send(view=streak_card(target.id), allowed_mentions=NO_PING)
 
 
 # ============================================================ /member stats  (also  .member stats  ?member stats)
@@ -5155,7 +5246,7 @@ def win_rate_text(w: int, l: int) -> str:
 
 
 def overall_rows():
-    """Duel + Spar added together (all-time, global), ranked like a leaderboard."""
+    """Duel all-time (global), ranked like a leaderboard."""
     tally = {}
     for mode in LB_MODES:
         for uid, w, l in standings(mode, "all"):
@@ -5173,9 +5264,8 @@ def stats_for(uid: int, view: str):
 
 
 class StatsView(discord.ui.LayoutView):
-    """Member stats card. Overall by default; the Duel / Spar buttons switch it (press the active one again to go back).
-    Only the person who asked can use the buttons."""
-    TITLES = {"overall": "Member Statistics", "duel": "Duel Statistics", "spar": "Spar Statistics"}
+    """Member stats card (Duel)."""
+    TITLES = {"overall": "Member Statistics", "duel": "Duel Statistics"}
 
     def __init__(self, asker_id: int, user, current: str = "overall"):
         super().__init__(timeout=300)
@@ -5201,27 +5291,8 @@ class StatsView(discord.ui.LayoutView):
         container = discord.ui.Container(accent_colour=STATS_BLACK)
         container.add_item(discord.ui.Section(head, discord.ui.TextDisplay("\n".join(body)),
                                               accessory=discord.ui.Thumbnail(user.display_avatar.url)))
-        if self.current == "overall":
-            lines = []
-            for mode in LB_MODES:
-                _, mw, ml, _ = stats_for(user.id, mode)
-                lines.append(f"**{MODES[mode]['name']}:** `{mw}`W  `{ml}`L  -  `{win_rate_text(mw, ml)}`")
-            container.add_item(discord.ui.Separator())
-            container.add_item(discord.ui.TextDisplay("\n".join(lines)))
         container.add_item(discord.ui.Separator())
         container.add_item(discord.ui.TextDisplay("-# Rivalz | Global all-time leaderboard"))
-        row = discord.ui.ActionRow()
-        for key in ("duel", "spar"):
-            btn = discord.ui.Button(label=MODES[key]["name"], custom_id=f"stats:{key}", disabled=disabled,
-                                    style=discord.ButtonStyle.primary if key == self.current else discord.ButtonStyle.secondary)
-            btn.callback = self._make(key)
-            row.add_item(btn)
-        if self.current != "overall":   # Duel / Spar view: a clear way back to the main card
-            back = discord.ui.Button(label="Go Back", custom_id="stats:back", disabled=disabled,
-                                     style=discord.ButtonStyle.danger)
-            back.callback = self._back
-            row.add_item(back)
-        container.add_item(row)
         self.add_item(container)
 
     def _make(self, key):
@@ -5252,7 +5323,7 @@ class StatsView(discord.ui.LayoutView):
 member_group = app_commands.Group(name="member", description="Member tools.")
 
 
-@member_group.command(name="stats", description="See Overall stats (plus Duel and Spar) of yourself or any member.")
+@member_group.command(name="stats", description="See the Duel stats of yourself or any member.")
 @app_commands.describe(member="Whose stats to show (default: you)")
 async def member_stats_cmd(interaction: discord.Interaction, member: discord.User = None):
     await interaction.response.defer()
@@ -5337,13 +5408,6 @@ async def set_count(interaction: discord.Interaction, mode: str, user: discord.U
 async def set_count_d(interaction: discord.Interaction, user: discord.User,
                       wins: app_commands.Range[int, 0, 100000] = None, losses: app_commands.Range[int, 0, 100000] = None):
     await set_count(interaction, "duel", user, wins, losses)
-
-
-@count_group.command(name="s", description="Developer only: set a player's SPAR wins / losses on the leaderboard.")
-@app_commands.describe(user="Whose count to set", wins="Total spar wins", losses="Total spar losses")
-async def set_count_s(interaction: discord.Interaction, user: discord.User,
-                      wins: app_commands.Range[int, 0, 100000] = None, losses: app_commands.Range[int, 0, 100000] = None):
-    await set_count(interaction, "spar", user, wins, losses)
 
 
 bot.tree.add_command(set_group)
