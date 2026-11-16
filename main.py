@@ -4233,14 +4233,55 @@ async def squad_new_state(user) -> dict:
             "cap_name": (prof or {}).get("roblox_name") or "Username not set", "cap_display": user.display_name}
 
 
-VS_FILE_NAMES = ("vs.jpg", "vs.png", "vs.jpeg")
-VS_SIZE = (1000, 497)     # same shape as the background, small enough to sit neatly across the Teams Announced card
-# The background (vs.jpg) is 1779 x 884 with a placeholder circle for two players on each side. These are the
-# placeholder centres, in that picture's own pixels: [left team (blue), right team (red)] x [top, bottom].
+# ======================================================================================================
+#  VS PICTURE SETTINGS  (the image on top of "Teams Announced").  Edit the numbers below, then run
+#  preview_vs.py to see the result without starting the bot.  All pixel numbers are on the ORIGINAL
+#  1779 x 884 background, the final picture is cropped and shrunk automatically.
+# ======================================================================================================
+VS_FILE_NAMES = ("vs_clean.jpg", "vs.jpg", "vs.png", "vs.jpeg")   # vs_clean.jpg = the background without the Discord logo circles
+VS_WIDTH = 900            # final width in pixels. The height follows the crop below, so nothing is stretched
 VS_NATIVE = (1779, 884)
-VS_SLOTS = (((438, 129), (438, 714)), ((1342, 131), (1342, 717)))
+
+# Default look of every profile picture
+VS_STYLE = {
+    "size": 216,          # width/height of the profile picture in pixels (bigger number = bigger picture)
+    "ring": 8,            # thickness of the coloured ring
+    "rotate": 0,          # degrees, positive = counter-clockwise. A circle only turns the picture inside it,
+                          # use shape "square" or "rounded" to see the whole frame tilt
+    "shape": "circle",    # "circle", "rounded" or "square"
+}
+VS_RINGS = ((30, 144, 255), (255, 42, 26))     # ring colour: team A (blue), team B (red)
+
+# Where the pictures go when a team has 2 players: [team A, team B] x [first player, second player] (x, y)
+VS_SLOTS = (((205, 280), (544, 558)), ((1539, 280), (1255, 558)))
+
+# Change ONE picture. Key = (team, player): team 0 = left/blue, team 1 = right/red, player 0 = first (the
+# captain), 1 = second ... Any of x, y, size, ring, rotate, shape can be set, the rest stay as above. Examples:
+#   (0, 0): {"size": 260},                                  -> bigger captain A
+#   (1, 1): {"rotate": 15, "shape": "rounded", "x": 1300},  -> tilted rounded frame, moved to x = 1300
+#   (0, 1): {"y": 650, "rotate": -10},
+VS_OVERRIDES = {
+    (0, 0): {"shape": "rounded", "size": 252, "ring": 12, "rotate": 16},
+    (0, 1): {"shape": "rounded", "size": 252, "ring": 12, "rotate": -15},
+    (1, 0): {"shape": "rounded", "size": 252, "ring": 12, "rotate": -16},
+    (1, 1): {"shape": "rounded", "size": 252, "ring": 12, "rotate": 24},
+}
+
+# Empty space is cut away so the profiles and the VS logo sit close together. VS_CROP_PAD = how much background
+# (in original pixels) stays around the outermost profile / the VS logo. Smaller = tighter picture.
+# Or set VS_CROP = (left, top, right, bottom) to choose the crop yourself, e.g. (0, 60, 1779, 800).
+VS_CROP_PAD = 14
+VS_CROP = None
+VS_LOGO_BOX = (660, 250, 1120, 620)      # where the VS logo sits in the background (never cropped)
+
+# Only used if you want a different look for one whole team (same keys as VS_STYLE), e.g. {"rotate": 8}
+VS_TEAM_STYLE = ({}, {})
+# ======================================================================================================
+
+# Where the Discord-logo circles are baked into vs.jpg (do not change unless you change vs.jpg). Any of them that
+# your pictures do not fully cover is wiped automatically.
+VS_PLACEHOLDERS = ((438, 129), (438, 714), (1342, 131), (1342, 717))
 VS_PLACEHOLDER_R = 118
-VS_RINGS = ((30, 144, 255), (255, 42, 26))     # blue ring for team A, red ring for team B
 
 
 def find_vs_image() -> str:
@@ -4252,31 +4293,44 @@ def find_vs_image() -> str:
     return ""
 
 
-def _vs_avatar(data, r: int, ring_rgb, tint):
-    """A round profile picture (radius r) with a coloured ring. A grey disc when there is no picture."""
+def _vs_tile(data, size: int, ring: int, ring_rgb, tint, rotate: float, shape: str):
+    """One finished profile picture: the picture, a coloured ring, a shape and a rotation."""
     from PIL import Image, ImageDraw
-    ring = max(6, r // 13)
-    d = r * 2
+    d = max(10, int(size))
+    ring = max(0, int(ring))
     av = None
     if data:
         try:
-            av = Image.open(io.BytesIO(data)).convert("RGBA").resize((d, d), Image.LANCZOS)
+            av = Image.open(io.BytesIO(data)).convert("RGBA")
         except Exception:
             av = None
     if av is None:
-        av = Image.new("RGBA", (d, d), tint + (255,))
-    out = Image.new("RGBA", (d + ring * 2, d + ring * 2), (0, 0, 0, 0))
-    ImageDraw.Draw(out).ellipse((0, 0, out.width - 1, out.height - 1), fill=ring_rgb + (255,))
+        av = Image.new("RGBA", (256, 256), tint + (255,))
+    if shape == "circle" and rotate:     # a circle looks the same turned, so the picture inside is what turns
+        big = av.resize((int(d * 1.5), int(d * 1.5)), Image.LANCZOS).rotate(rotate, resample=Image.BICUBIC)
+        left = (big.width - d) // 2
+        av = big.crop((left, left, left + d, left + d))
+    else:
+        av = av.resize((d, d), Image.LANCZOS)
+    total = d + ring * 2
+    corner = {"circle": total // 2, "rounded": total // 5, "square": 0}.get(shape, total // 2)
+    inner_corner = max(0, corner - ring)
+    tile = Image.new("RGBA", (total, total), (0, 0, 0, 0))
+    ImageDraw.Draw(tile).rounded_rectangle((0, 0, total - 1, total - 1), radius=corner, fill=ring_rgb + (255,))
     mask = Image.new("L", (d, d), 0)
-    ImageDraw.Draw(mask).ellipse((0, 0, d - 1, d - 1), fill=255)
-    out.paste(av, (ring, ring), mask)
-    return out
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, d - 1, d - 1), radius=inner_corner, fill=255)
+    tile.paste(av, (ring, ring), mask)
+    if shape != "circle" and rotate:
+        tile = tile.rotate(rotate, resample=Image.BICUBIC, expand=True)
+    return tile
 
 
 def _vs_positions(n: int, side: int, W: int, H: int):
-    """Where the n pictures of one team go: 2 players use the background's own circles; more are laid out in a grid."""
-    if n <= 2:
-        return list(VS_SLOTS[side][:n]) if n == 2 else [((VS_SLOTS[side][0][0]), H // 2)]
+    """Where the n pictures of one team go: 2 players use VS_SLOTS, any other size is laid out in a grid."""
+    if n == 2:
+        return list(VS_SLOTS[side])
+    if n == 1:
+        return [(VS_SLOTS[side][0][0], H // 2)]
     cols = 1 if n <= 3 else 2
     rows = math.ceil(n / cols)
     cx0 = VS_SLOTS[side][0][0]
@@ -4285,15 +4339,13 @@ def _vs_positions(n: int, side: int, W: int, H: int):
     for k in range(n):
         row, col = divmod(k, cols)
         in_row = cols if (row < rows - 1 or n % cols == 0) else n % cols
-        x = cx0 + (col - (in_row - 1) / 2) * pitch
-        y = H * (row + 0.5) / rows
-        out.append((int(x), int(y)))
+        out.append((int(cx0 + (col - (in_row - 1) / 2) * pitch), int(H * (row + 0.5) / rows)))
     return out
 
 
 def render_vs_card(teams_avatars) -> bytes:
-    """teams_avatars = [[bytes|None, ...] team A, [...] team B]. Draws every player's profile picture on their
-    side of the VS background (blue = team A, red = team B) and resizes the result to fit the card."""
+    """teams_avatars = [[bytes|None, ...] team A, [...] team B]. Draws every player's picture on their side of
+    the VS background using the VS_* settings above, crops it tight and shrinks it to VS_WIDTH."""
     from PIL import Image, ImageDraw, ImageFilter
     path = find_vs_image()
     if path:
@@ -4304,28 +4356,43 @@ def render_vs_card(teams_avatars) -> bytes:
         base = Image.new("RGBA", VS_NATIVE, (190, 30, 20, 255))
         ImageDraw.Draw(base).rectangle((0, 0, VS_NATIVE[0] // 2, VS_NATIVE[1]), fill=(25, 85, 190, 255))
     W, H = base.size
-    counts = [len(t) for t in teams_avatars[:2]]
-    if path and any(c != 2 for c in counts):             # not 2 per side: wipe the placeholder circles first
-        for side in (0, 1):
-            for cx, cy in VS_SLOTS[side]:
-                box = (cx - VS_PLACEHOLDER_R - 30, cy - VS_PLACEHOLDER_R - 30, cx + VS_PLACEHOLDER_R + 30, cy + VS_PLACEHOLDER_R + 30)
-                x0, y0 = max(0, box[0]), max(0, box[1])
-                x1, y1 = min(W, box[2]), min(H, box[3])
-                ring_pix = base.crop((x0, y0, x1, y1)).resize((1, 1), Image.BOX).getpixel((0, 0))
-                fill = Image.new("RGBA", (x1 - x0, y1 - y0), ring_pix)
-                m = Image.new("L", fill.size, 0)
-                ImageDraw.Draw(m).ellipse((cx - x0 - VS_PLACEHOLDER_R - 6, cy - y0 - VS_PLACEHOLDER_R - 6,
-                                           cx - x0 + VS_PLACEHOLDER_R + 6, cy - y0 + VS_PLACEHOLDER_R + 6), fill=255)
-                base.paste(fill, (x0, y0), m.filter(ImageFilter.GaussianBlur(10)))
+    tiles = []                                           # (tile, cx, cy) for every player
     for side in (0, 1):
         pics = list(teams_avatars[side])
         n = len(pics)
-        r = 108 if n <= 2 else 92 if n <= 3 else max(46, min(78, 330 // max(1, math.ceil(n / 2))))
+        shrink = 1.0 if n <= 2 else 0.85 if n <= 3 else max(0.4, min(0.72, 330 / max(1, math.ceil(n / 2)) / (VS_STYLE["size"] / 2)))
         tint = (40, 70, 130) if side == 0 else (120, 30, 30)
-        for (cx, cy), data in zip(_vs_positions(n, side, W, H), pics):
-            pic = _vs_avatar(data, r, VS_RINGS[side], tint)
-            base.alpha_composite(pic, (cx - pic.width // 2, cy - pic.height // 2))
-    base = base.convert("RGB").resize(VS_SIZE, Image.LANCZOS)
+        for k, ((cx, cy), data) in enumerate(zip(_vs_positions(n, side, W, H), pics)):
+            st = dict(VS_STYLE)
+            st.update(VS_TEAM_STYLE[side])
+            st.update(VS_OVERRIDES.get((side, k), {}))
+            size = st["size"] * shrink
+            cx, cy = st.get("x", cx), st.get("y", cy)
+            tile = _vs_tile(data, size, st["ring"], VS_RINGS[side], tint, st["rotate"], st["shape"])
+            tiles.append((tile, cx, cy, size / 2 + st["ring"]))
+    if path and os.path.basename(path) != "vs_clean.jpg":   # an old vs.jpg: wipe the logo circles no picture covers
+        for px, py in VS_PLACEHOLDERS:
+            if any(math.hypot(cx - px, cy - py) <= 6 and rad >= VS_PLACEHOLDER_R - 4 for _t, cx, cy, rad in tiles):
+                continue
+            R = VS_PLACEHOLDER_R
+            x0, y0, x1, y1 = max(0, px - R - 30), max(0, py - R - 30), min(W, px + R + 30), min(H, py + R + 30)
+            mean = base.crop((x0, y0, x1, y1)).resize((1, 1), Image.BOX).getpixel((0, 0))
+            m = Image.new("L", (x1 - x0, y1 - y0), 0)
+            ImageDraw.Draw(m).ellipse((px - x0 - R - 6, py - y0 - R - 6, px - x0 + R + 6, py - y0 + R + 6), fill=255)
+            base.paste(Image.new("RGBA", m.size, mean), (x0, y0), m.filter(ImageFilter.GaussianBlur(10)))
+    for tile, cx, cy, _r in tiles:
+        base.alpha_composite(tile, (int(cx - tile.width / 2), int(cy - tile.height / 2)))
+    if VS_CROP:
+        box = tuple(VS_CROP)
+    else:                                                # tight box around every picture and the VS logo
+        l, t, r, b = VS_LOGO_BOX
+        for tile, cx, cy, _r in tiles:
+            l, t = min(l, cx - tile.width / 2), min(t, cy - tile.height / 2)
+            r, b = max(r, cx + tile.width / 2), max(b, cy + tile.height / 2)
+        box = (l - VS_CROP_PAD, t - VS_CROP_PAD, r + VS_CROP_PAD, b + VS_CROP_PAD)
+    box = (max(0, int(box[0])), max(0, int(box[1])), min(W, int(box[2])), min(H, int(box[3])))
+    base = base.convert("RGB").crop(box)
+    base = base.resize((VS_WIDTH, max(1, round(VS_WIDTH * base.height / base.width))), Image.LANCZOS)
     out = io.BytesIO()
     base.save(out, "JPEG", quality=92)
     return out.getvalue()
