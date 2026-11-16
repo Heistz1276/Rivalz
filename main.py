@@ -1,5 +1,5 @@
 """
-Rivalz - Matchmaking bot for Duels
+Rivalz - Matchmaking bot for Duels and Spars
 Requires: discord.py >= 2.6 (Components V2 + modal selects), aiohttp, python-dotenv, Pillow
 Run:      py main.py
 Needs the MESSAGE CONTENT INTENT enabled in the Developer Portal (Bot tab) for the gank image step.
@@ -82,7 +82,7 @@ DEVELOPER_URL = os.getenv("DEVELOPER_URL", "").strip() or (f"https://discord.com
 # setup (see migrate_legacy). Every other server gets its channels from /build.
 LEGACY = {
     "panel": 1568343031294459904, "log": 1568525004164042842, "results": 1568527659334377492,
-    "duel_lb": 1568637988164862133,
+    "duel_lb": 1568637988164862133, "spar_lb": 1568637960855879680,
     "cat_main": 1568343167437115423, "cat_tickets": 1568527718419664927,
     "ongoing": 1568968016493027328, "ongoing_role": 1568968211083567195,
     "streaks": 1570471881520451795,
@@ -95,7 +95,7 @@ GANK_SECONDS = 120
 RIVALZ_COOLDOWN = 3           # seconds between "Rivalz <command>" messages from the same person (the developer is exempt)
 LB_RESET_ID = ""   # leaderboard wipe is DISABLED. Nothing is ever reset or deleted by an update.
 MSG_NOTICE_EVERY = 15         # the "Match Details" card is posted at 15 messages, again at 30 (old one removed), 45, ...
-LB_MODES = ("duel",)
+LB_MODES = ("duel", "spar")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -116,20 +116,20 @@ os.makedirs(DATA_DIR, exist_ok=True)
 EPHEMERAL_DISK = ON_RAILWAY and not (os.getenv("DATA_DIR", "").strip() or VOLUME_DIR)
 DATA_FILE = os.path.join(DATA_DIR, "rivalz_data.json")
 
-class _Modes(dict):
-    """Duel is the only mode now. A leftover ticket saved as 'spar' is simply treated as a Duel (nothing is deleted)."""
-    def __missing__(self, key):
-        return self["duel"]
-
-
-MODES = _Modes({
+MODES = {
     "duel": {
         "name": "Duel",
         "prefix": "clash",
         "taunt": "> Prove who is stronger. Accept to open a private ticket and voice channel.",
         "colour": 0xE74C3C,
     },
-})
+    "spar": {
+        "name": "Spar",
+        "prefix": "warmup",
+        "taunt": "> Warm up and sharpen your skills together. Accept to open a private ticket and voice channel.",
+        "colour": 0x3498DB,
+    },
+}
 GREEN, RED, GREY = 0x2ECC71, 0xE74C3C, 0x95A5A6
 STATUS_TEXT = {"open": "Open", "ended": "Ended", "finished": "Recorded"}
 
@@ -448,7 +448,7 @@ class Store:
                 print(f"Could not read {path}, starting fresh: {exc}")
                 self.d = {}
         self.d.setdefault("counters", {})
-        for mode in ("duel",):
+        for mode in ("duel", "spar"):
             self.d["counters"].setdefault(mode, 0)
         for key in ("challenges", "profiles", "tickets", "archive", "guilds"):
             self.d.setdefault(key, {})
@@ -2286,7 +2286,7 @@ def rank_view(uid: int, mention: bool = False):
 
 def lb_query(text: str):
     """'top 3 duel weekly' / 'who is the best' / 'leaderboard' -> (mode or None, period, how many)."""
-    mode = "duel" if re.search(r"\bduels?\b", text) else None
+    mode = "duel" if re.search(r"\bduels?\b", text) else "spar" if re.search(r"\bspar(?:s|ring)?\b", text) else None
     period = "day" if re.search(r"\b(?:daily|today|day)\b", text) else "week" if re.search(r"\b(?:weekly|week)\b", text) else "all"
     m = re.search(r"\b(?:top|first)\s*#?(\d{1,2})\b", text) or re.search(r"#(\d{1,2})\b", text)
     if m:
@@ -2321,9 +2321,9 @@ def help_view():
     return build_card("Rivalz Commands", [
         ["> Start a message with **R** or **Rivalz** and a command instead of using `/`."],
         ["`R ping` - check that Rivalz is online",
-         "`R leaderboard` / `R top 3` / `R who is top 1` - current standings (add `weekly` or `daily`)",
-         "`R rank` or `R rank @user` - Duel rank",
-         "`R streak` or `R streak @user` - current win streak, best streak and next milestone",
+         "`R leaderboard` / `R top 3` / `R who is top 1` - current standings (add `duel`, `spar`, `weekly`, `daily`)",
+         "`R rank` or `R rank @user` - Duel and Spar rank",
+         "`R streak` or `R streak @user` - current win streak, best streak and the server record",
          "`R open general` - posts the channel link and a button that jumps straight to it (short names work, like `ann`)",
          "`R open Divisions category` - lists every channel in that category",
          "`R channels` / `R channels in <category>` - list the channels you can see"],
@@ -2564,7 +2564,8 @@ async def rivalz_text(message):
         return await message.reply(view=help_view(), mention_author=False, allowed_mentions=NO_PING)
     if kind == "streak":
         target = target_of(message)
-        return await message.reply(view=streak_card(target or uid), mention_author=False, allowed_mentions=NO_PING)
+        return await message.reply(view=streak_card(target or uid, mention=bool(target and target != uid)),
+                                   mention_author=False, allowed_mentions=NO_PING)
     if kind == "rank":
         target = target_of(message)
         return await message.reply(view=rank_view(target or uid, mention=bool(target and target != uid)),
@@ -3196,23 +3197,26 @@ class ConfigModal(discord.ui.Modal):
 
 
 HELP_SECTIONS = [
-    ["> Pick **Duel**, choose a rival and rounds. Your rival accepts in their DMs."],
+    ["> Pick **Duel** or **Spar**, choose a rival and rounds. Your rival accepts in their DMs."],
     ["`1` Select a mode, enter your Roblox username (saved for next time), pick **first to** how many rounds and paste your **server link**.",
      "`2` Your rival presses **Accept** and a private ticket with a voice channel opens.",
      "`3` Fight, then each player adds their own score. First to the chosen rounds wins (first to 5 lasts 9 rounds at most).",
      "`4` Press **End**. Send the gank image if you have one (optional), then press **Delete Ticket**."],
+    ["> **Squad Up** is for team matches: pick the size (2v2, 3v3, 5v5 or custom) and first to how many rounds, then **Manual selection** (you choose both teams; you are Captain A and the first rival to accept becomes Captain B) or **Random matchmaking** (a lobby with a Join button; when it is full the bot splits everyone into equal teams)."],
     [f"> Live matches are announced in the **ongoing-ping** channel. Press **Join as Spectator** to watch (no limit, one match at a time)."],
     ["> **Settings** is optional. Fake challenges or scores lead to a blacklist."],
 ]
 
-PANEL_INTRO = "> Challenge a rival to a **Duel**. Private ticket, voice channel and tracked scores."
+PANEL_INTRO = "> Challenge a rival to a **Duel** or train in a **Spar**. Private ticket, voice channel and tracked scores."
 PANEL_MODES = (
     "**Duel** `Competitive` A match with a winner and a loser.\n"
+    "**Spar** `Practice` Warm up and train together.\n"
+    "**Squad Up** `Team` 2v2, 3v3, 5v5 or custom. Pick the teams yourself or let the bot split a lobby fairly.\n"
     "**Format** `First to` Pick first to 1, 3, 5 or your own number. The first player to reach it wins."
 )
 PANEL_HOW = (
     "### How it works\n"
-    "> `1` Pick **Duel** below\n"
+    "> `1` Pick **Duel**, **Spar** or **Squad Up** below\n"
     "> `2` Enter your username, rival, first to (rounds) and server link\n"
     "> `3` Your rival accepts in their DMs\n"
     "> `4` Fight, add scores and finish"
@@ -3245,18 +3249,27 @@ class ModeSelect(discord.ui.Select):
     def __init__(self):
         super().__init__(
             custom_id="rv:mode",
-            placeholder="Start a Duel...",
+            placeholder="Select a mode...",
             options=[
                 discord.SelectOption(label="Duel", value="duel", description="Competitive match against a rival you pick."),
+                discord.SelectOption(label="Spar", value="spar", description="Practice round to warm up and train together."),
+                discord.SelectOption(label="Squad Up", value="squad", description="Team match: 2v2, 3v3, 5v5 or custom."),
             ],
         )
 
     async def callback(self, interaction: discord.Interaction):
         if not await guard(interaction):
             return
-        mode = "duel"   # an old panel message may still offer Spar: it always opens a Duel now
-        prof = store.d["profiles"].get(str(interaction.user.id), {})
-        await interaction.response.send_modal(ChallengeModal(mode, prof))
+        mode = self.values[0]
+        if mode == "squad":
+            await interaction.response.defer(ephemeral=True)      # the card image takes a moment to draw
+            state = await squad_new_state(interaction.user)
+            view, file = await squad_setup_payload(state)
+            await interaction.followup.send(view=view, file=file, ephemeral=True)
+            state["origin"] = interaction
+        else:
+            prof = store.d["profiles"].get(str(interaction.user.id), {})
+            await interaction.response.send_modal(ChallengeModal(mode, prof))
         try:  # reset the menu so the same mode can be picked again
             await interaction.message.edit(view=PanelView(), attachments=list(interaction.message.attachments))
         except discord.HTTPException:
@@ -3287,6 +3300,1200 @@ class PanelView(discord.ui.LayoutView):
         self.add_item(c)
 
 
+# ============================================================ Squad Up (2v2 / 3v3 / 5v5 / custom: lobby + team ticket)
+# Panel -> Squad Up -> team size (2v2, 3v3, 5v5, Custom) -> Manual selection or Random matchmaking -> a lobby card with a
+# Join button and a live list ("3 of 6 joined"). When the lobby is full the teams are announced and a squad ticket
+# (text channel + voice channel) opens. Squad matches are tracked in their own tables and never touch the Duel/Spar boards.
+SQUAD_COLOUR = 0x9B59B6
+SQUAD_MIN, SQUAD_MAX = 2, 10          # players per team (custom size)
+SQUAD_TEAMS = ("Team A", "Team B")
+SQUAD_PICK = {"manual": "Manual selection", "random": "Random matchmaking"}
+# Squad lobby cards are posted here (in the server that owns this channel). Other servers use the channel Squad Up was started in.
+SQUAD_LOBBY_CHANNEL_ID = env_int("SQUAD_LOBBY_CHANNEL_ID", 1571580816595623976)
+_SQUAD_LOCK = None
+
+
+def squad_lock():
+    global _SQUAD_LOCK
+    if _SQUAD_LOCK is None:
+        _SQUAD_LOCK = asyncio.Lock()
+    return _SQUAD_LOCK
+
+
+def squad_lobbies() -> dict:
+    return store.d.setdefault("squad_lobbies", {})
+
+
+def squad_tickets() -> dict:
+    return store.d.setdefault("squad_tickets", {})
+
+
+def squad_format(size: int) -> str:
+    return f"{size}v{size}"
+
+
+def roblox_of(uid):
+    """The saved Roblox profile of a Discord user (from Settings), or None."""
+    prof = store.d["profiles"].get(str(uid)) or {}
+    if prof.get("roblox_id") and prof.get("roblox_name"):
+        return {k: prof.get(k) for k in ("roblox_id", "roblox_name", "roblox_display")}
+    return None
+
+
+def lobby_total(L) -> int:
+    return L["size"] * 2
+
+
+def lobby_ids(L) -> list:
+    return [p["discord_id"] for p in L["players"]]
+
+
+def assigned_ids(L) -> list:
+    return [uid for team in (L.get("assigned") or []) for uid in team]
+
+
+def squad_open_lobby_of(uid: int, exclude=None):
+    for lid, L in squad_lobbies().items():
+        if lid != exclude and L["status"] in ("open", "starting") and uid in lobby_ids(L):
+            return L
+    return None
+
+
+def squad_save_profile(uid: int, rb: dict):
+    prof = store.d["profiles"].setdefault(str(uid), {})
+    prof.update({"roblox_id": rb["id"], "roblox_name": rb["name"], "roblox_display": rb["display"]})
+    store.save()
+
+
+# ---------- lobby card
+def lobby_view(L, top_text=None):
+    size, total, status = L["size"], lobby_total(L), L["status"]
+    joined = {p["discord_id"]: p for p in L["players"]}
+    manual = L["pick"] == "manual"
+    view = discord.ui.LayoutView(timeout=None)
+    if top_text:
+        view.add_item(discord.ui.TextDisplay(top_text))
+    colour = {"open": SQUAD_COLOUR, "starting": SQUAD_COLOUR, "started": GREEN}.get(status, GREY)
+    c = discord.ui.Container(accent_colour=colour)
+    c.add_item(discord.ui.TextDisplay(f"## Squad Up | {squad_format(size)}"))
+    c.add_item(discord.ui.Separator())
+    info = (f"> **Format:** `{squad_format(size)}` ({size} players per team)\n"
+            f"> **Teams:** `{SQUAD_PICK[L['pick']]}`\n"
+            f"> **Host:** <@{L['host']}>\n"
+            f"> **Rounds:** `{rounds_text(L['rounds'])}`\n"
+            f"> **Server:** `{server_label(L.get('server'))} set`")
+    if manual and status in ("open", "starting"):
+        cb = L.get("captain_b")
+        info += f"\n> **Captain A:** <@{L['host']}>\n> **Captain B:** " + (f"<@{cb}>" if cb else "`first rival to accept`")
+    if status == "open":
+        info += f"\n> **Expires:** <t:{int(L['expires'])}:R>"
+    c.add_item(discord.ui.TextDisplay(info))
+    c.add_item(discord.ui.Separator())
+
+    if status == "started":
+        caps = L.get("captains") or [None, None]
+        lines = ["### Teams Locked", f"> **Captain A:** <@{caps[0]}>  |  **Captain B:** <@{caps[1]}>"]
+        for i, team in enumerate(L.get("final") or []):
+            lines.append(f"**{SQUAD_TEAMS[i]}**")
+            lines += [f"> <@{p['discord_id']}> (`@{esc(p['roblox_name'])}`)" + (" **(Captain)**" if p["discord_id"] == caps[i] else "")
+                      for p in team]
+        c.add_item(discord.ui.TextDisplay("\n".join(lines)))
+    else:
+        lines = [f"### Lobby\n> **{len(joined)} of {total} joined**"]
+        if manual:
+            for i, team in enumerate(L["assigned"]):
+                lines.append(f"**{SQUAD_TEAMS[i]}**")
+                for uid in team:
+                    tag = " **(Captain)**" if (i == 0 and uid == L["host"]) or (i == 1 and uid == L.get("captain_b")) else ""
+                    if uid in joined:
+                        lines.append(f"> <@{uid}> (`@{esc(joined[uid]['roblox_name'])}`) - Ready{tag}")
+                    else:
+                        lines.append(f"> <@{uid}> - Waiting")
+        else:
+            for n, p in enumerate(L["players"], 1):
+                lines.append(f"`{n}.` <@{p['discord_id']}> (`@{esc(p['roblox_name'])}`)")
+            for n in range(len(L["players"]) + 1, total + 1):
+                lines.append(f"`{n}.` Open slot")
+            waiting = [u for u in (L.get("invited") or []) if u not in joined]
+            if waiting:
+                lines.append("**Invited:** " + " ".join(f"<@{u}>" for u in waiting[:25]))
+        c.add_item(discord.ui.TextDisplay("\n".join(lines)))
+
+    note = {
+        "open": ("> Fixed teams: only the players listed above can join. Rivals get an invite in their DMs, and the first rival to press **Accept** becomes Captain B." if manual else
+                 "> Press **Join** to take a slot. When the lobby is full the bot splits everyone into equal teams."),
+        "starting": "> The lobby is full. Creating the teams and the ticket...",
+        "started": "> The ticket is open. Good luck.",
+        "cancelled": "> This lobby was cancelled by the host.",
+        "expired": "> This lobby expired before it filled up.",
+    }.get(status, "")
+    if note:
+        c.add_item(discord.ui.Separator())
+        c.add_item(discord.ui.TextDisplay(note))
+
+    buttons = []
+    if status == "open":
+        buttons = [SquadLobbyButton("join", L["id"]), SquadLobbyButton("leave", L["id"]), SquadLobbyButton("cancel", L["id"])]
+    elif status == "started" and L.get("ticket_channel"):
+        buttons = [discord.ui.Button(label="Open Ticket", url=f"https://discord.com/channels/{L['guild_id']}/{L['ticket_channel']}")]
+    if buttons:
+        add_buttons(c, buttons)
+    view.add_item(c)
+    return view
+
+
+async def refresh_lobby(L, top_text=None):
+    try:
+        chan = bot.get_channel(L["channel_id"]) or await bot.fetch_channel(L["channel_id"])
+        await chan.get_partial_message(L["message_id"]).edit(view=lobby_view(L, top_text=top_text))
+    except discord.HTTPException as exc:
+        print(f"Could not refresh the squad lobby card: {exc!r}")
+
+
+# ---------- first to accept: DM invites to the rival team (manual mode)
+def invite_view(L, host):
+    return build_card(
+        "Squad Invite",
+        [[f"> **{md(host.display_name)}** invited you to a **{squad_format(L['size'])}** squad match on the other team.",
+          "> The first rival to press **Accept** becomes **Captain B**."],
+         [f"**Captain A:** {host.mention}", field("Format", squad_format(L["size"])), field("Rounds", rounds_text(L["rounds"])),
+          field("Server", server_label(L.get("server")))],
+         [f"> This invite closes <t:{int(L['expires'])}:R>."]],
+        accent=SQUAD_COLOUR, buttons=[SquadInviteButton("acc", L["id"]), SquadInviteButton("dec", L["id"])])
+
+
+def invite_done_view(L):
+    cb = L.get("captain_b")
+    return build_card(
+        "Invite Accepted",
+        [f"> You joined the **{squad_format(L['size'])}** lobby.",
+         f"> **Captain A:** <@{L['host']}>\n> **Captain B:** " + (f"<@{cb}>" if cb else "`first rival to accept`")],
+        accent=GREEN)
+
+
+class SquadInviteButton(discord.ui.DynamicItem[discord.ui.Button], template=r"rv:sqi:(?P<act>acc|dec):(?P<lid>[0-9a-f]{8})"):
+    def __init__(self, act: str, lid: str):
+        accept = act == "acc"
+        super().__init__(discord.ui.Button(label="Accept" if accept else "Decline",
+                                           style=discord.ButtonStyle.success if accept else discord.ButtonStyle.danger,
+                                           custom_id=f"rv:sqi:{act}:{lid}"))
+        self.act, self.lid = act, lid
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        return cls(match["act"], match["lid"])
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        await safe_reply(interaction, "Something went wrong. Please try again.")
+        print(f"SquadInviteButton({self.act}) error: {error!r}")
+
+    async def callback(self, interaction: discord.Interaction):
+        L = squad_lobbies().get(self.lid)
+        if not L or L["status"] != "open":
+            return await interaction.response.edit_message(
+                view=build_card("Invite Closed", ["> This squad lobby is no longer open."], accent=GREY))
+        user = interaction.user
+        if L["pick"] != "manual" or user.id not in (L.get("assigned") or [[], []])[1]:
+            return await interaction.response.send_message("This invite is not for you.", ephemeral=True)
+        if not await guard(interaction, L["guild_id"]):
+            return
+        if self.act == "dec":
+            await interaction.response.edit_message(view=build_card("Invite Declined", ["> You declined this squad invite."], accent=RED))
+            return await sq_say(L, "Invite Declined", f"> **{md(user.display_name)}** declined the invite. They can still press **Join** in the lobby.", RED)
+        err = sq_join_error(L, user)
+        if err:
+            return await notice(interaction, "Cannot Accept", err)
+        prof = roblox_of(user.id)
+        if not prof:
+            return await interaction.response.send_modal(SquadNameModal(L["id"], invite=True))
+        await interaction.response.defer()
+        if await sq_add_player(interaction, L["id"], user, prof):
+            try:
+                await interaction.edit_original_response(view=invite_done_view(squad_lobbies()[L["id"]]))
+            except discord.HTTPException:
+                pass
+
+
+# ---------- lobby buttons
+class SquadLobbyButton(discord.ui.DynamicItem[discord.ui.Button], template=r"rv:sq:(?P<act>join|leave|cancel):(?P<lid>[0-9a-f]{8})"):
+    LOOK = {"join": ("Join", discord.ButtonStyle.success),
+            "leave": ("Leave", discord.ButtonStyle.secondary),
+            "cancel": ("Cancel Lobby", discord.ButtonStyle.danger)}
+
+    def __init__(self, act: str, lid: str):
+        label, style = self.LOOK[act]
+        super().__init__(discord.ui.Button(label=label, style=style, custom_id=f"rv:sq:{act}:{lid}"))
+        self.act, self.lid = act, lid
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        return cls(match["act"], match["lid"])
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        await safe_reply(interaction, "Something went wrong. Please try again.")
+        print(f"SquadLobbyButton({self.act}) error: {error!r}")
+
+    async def callback(self, interaction: discord.Interaction):
+        L = squad_lobbies().get(self.lid)
+        if not L or L["status"] != "open":
+            return await notice(interaction, "Lobby Closed", "> This squad lobby is no longer open.", accent=GREY)
+        if not await guard(interaction, L["guild_id"]):
+            return
+        await {"join": sq_join, "leave": sq_leave, "cancel": sq_cancel}[self.act](interaction, L)
+
+
+def sq_join_error(L, user):
+    if L is None or L["status"] != "open":
+        return "> This squad lobby is no longer open."
+    if user.bot:
+        return "> Bots cannot join a squad."
+    if user.id in lobby_ids(L):
+        return "> You are already in this lobby."
+    if L["pick"] == "manual" and user.id not in assigned_ids(L):
+        return "> This lobby has fixed teams chosen by the host. Only the listed players can join."
+    if len(L["players"]) >= lobby_total(L):
+        return "> This lobby is full."
+    if squad_open_lobby_of(user.id, exclude=L["id"]) and not is_owner(user):
+        return "> You are already in another squad lobby. Leave it first."
+    return None
+
+
+async def sq_join(interaction: discord.Interaction, L):
+    err = sq_join_error(L, interaction.user)
+    if err:
+        return await notice(interaction, "Cannot Join", err)
+    prof = roblox_of(interaction.user.id)
+    if not prof:
+        return await interaction.response.send_modal(SquadNameModal(L["id"]))
+    await interaction.response.defer()
+    await sq_add_player(interaction, L["id"], interaction.user, prof)
+
+
+async def sq_add_player(interaction: discord.Interaction, lid: str, user, prof: dict):
+    """interaction must already be answered (deferred)."""
+    async with squad_lock():
+        L = squad_lobbies().get(lid)
+        err = sq_join_error(L, user)
+        if err:
+            await notice(interaction, "Cannot Join", err)
+            return False
+        L["players"].append({"discord_id": user.id, **prof})
+        if L["pick"] == "manual" and not L.get("captain_b") and user.id in (L.get("assigned") or [[], []])[1]:
+            L["captain_b"] = user.id            # the first rival to accept is the captain of the other team
+        full = len(L["players"]) >= lobby_total(L)
+        if full:
+            L["status"] = "starting"
+        store.save()
+    await refresh_lobby(L)
+    if full:
+        await sq_start(L, interaction.guild or bot.get_guild(L["guild_id"]))
+    return True
+
+
+class SquadNameModal(discord.ui.Modal):
+    """Asked once when someone presses Join without a saved Roblox username."""
+    def __init__(self, lid: str, invite: bool = False):
+        super().__init__(title="Roblox Username", timeout=600)
+        self.lid, self.invite = lid, invite
+        self.name = discord.ui.TextInput(placeholder="Your Roblox username", min_length=3, max_length=20)
+        self.add_item(discord.ui.Label(text="Roblox Username", description="Saved to your Settings, so you only enter it once.",
+                                       component=self.name))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        L = squad_lobbies().get(self.lid)
+        err = sq_join_error(L, interaction.user)
+        if err:
+            return await notice(interaction, "Cannot Join", err)
+        rb = await bot.roblox.user_by_name(self.name.value.strip())
+        if not rb:
+            return await notice(interaction, "Not Found", "> That Roblox username was not found. Press **Join** and try again.")
+        squad_save_profile(interaction.user.id, rb)
+        if await sq_add_player(interaction, self.lid, interaction.user, roblox_of(interaction.user.id)):
+            if self.invite and interaction.message:      # accepted from the DM invite: close the invite card
+                try:
+                    await interaction.message.edit(view=invite_done_view(L))
+                except discord.HTTPException:
+                    pass
+            await interaction.followup.send(view=build_card(
+                "Joined", [f"> Username saved and you joined the **{squad_format(L['size'])}** lobby."], accent=GREEN), ephemeral=True)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        await safe_reply(interaction, "Something went wrong. Please try again.")
+        print(f"SquadNameModal error: {error!r}")
+
+
+async def sq_leave(interaction: discord.Interaction, L):
+    if interaction.user.id == L["host"]:
+        return await notice(interaction, "Host", "> You opened this lobby. Press **Cancel Lobby** to close it.", accent=GREY)
+    await interaction.response.defer()
+    async with squad_lock():
+        L = squad_lobbies().get(L["id"])
+        if not L or L["status"] != "open":
+            return
+        before = len(L["players"])
+        L["players"] = [p for p in L["players"] if p["discord_id"] != interaction.user.id]
+        if len(L["players"]) == before:
+            return await notice(interaction, "Not In Lobby", "> You are not in this lobby.", accent=GREY)
+        store.save()
+    await refresh_lobby(L)
+
+
+async def sq_cancel(interaction: discord.Interaction, L):
+    if interaction.user.id != L["host"] and not is_staff(interaction.user):
+        return await notice(interaction, "Not Allowed", "> Only the host or staff can cancel this lobby.")
+    await interaction.response.defer()
+    async with squad_lock():
+        L = squad_lobbies().get(L["id"])
+        if not L or L["status"] != "open":
+            return
+        L["status"] = "cancelled"
+        store.save()
+    await refresh_lobby(L)
+
+
+# ---------- teams + ticket
+def sq_make_teams(L):
+    size = L["size"]
+    if L["pick"] == "manual":
+        by_id = {p["discord_id"]: p for p in L["players"]}
+        return [[by_id[u] for u in team if u in by_id] for team in L["assigned"]]
+    pool = list(L["players"])
+    random.SystemRandom().shuffle(pool)       # a fair, unpredictable split
+    a, b = pool[:size], pool[size:size * 2]
+    if any(p["discord_id"] == L["host"] for p in b):    # the host is always on Team A, as its captain
+        a, b = b, a
+    return [a, b]
+
+
+def sq_captains(L, teams) -> list:
+    """Captain A is always the host. Captain B is the first rival who accepted (manual) or joined (random)."""
+    ids = [[p["discord_id"] for p in team] for team in teams]
+    cap_a = L["host"] if L["host"] in ids[0] else ids[0][0]
+    cap_b = L.get("captain_b") if L.get("captain_b") in ids[1] else None
+    if cap_b is None:
+        cap_b = next((u for u in lobby_ids(L) if u in ids[1]), ids[1][0])
+    return [cap_a, cap_b]
+
+
+async def sq_start(L, guild):
+    """The lobby is full (status 'starting'): fix the teams, open the ticket, announce."""
+    try:
+        missing = []
+        for p in L["players"]:     # everybody must still be in the server
+            try:
+                if not (guild.get_member(p["discord_id"]) or await guild.fetch_member(p["discord_id"])):
+                    missing.append(p["discord_id"])
+            except discord.HTTPException:
+                missing.append(p["discord_id"])
+        if missing:
+            async with squad_lock():
+                L["players"] = [p for p in L["players"] if p["discord_id"] not in missing]
+                L["status"] = "open"
+                store.save()
+            await refresh_lobby(L)
+            return await sq_say(L, "Lobby Reopened", "> Someone left the server, so their slot is open again.", RED)
+        teams = sq_make_teams(L)
+        captains = sq_captains(L, teams)
+        channel, st = await create_squad_ticket(guild, L, teams, captains)
+    except Exception as exc:
+        print(f"Squad ticket creation failed: {exc!r}")
+        async with squad_lock():
+            if L["pick"] == "random" and L["players"]:
+                L["players"].pop()           # the last joiner can press Join again
+            elif L["players"] and L["players"][-1]["discord_id"] != L["host"]:
+                L["players"].pop()
+            L["status"] = "open"
+            store.save()
+        await refresh_lobby(L)
+        return await sq_say(L, "Ticket Failed", "> The squad ticket could not be opened. The last player to join can press **Join** again.", RED)
+    async with squad_lock():
+        L["status"] = "started"
+        L["final"] = [[dict(p) for p in team] for team in teams]
+        L["captains"] = captains
+        L["ticket_channel"] = channel.id
+        store.save()
+    await refresh_lobby(L)
+    lines = []
+    for i, team in enumerate(teams):
+        lines.append(f"**{SQUAD_TEAMS[i]}:** " + ", ".join(f"<@{p['discord_id']}>" for p in team))
+    caps = [f"**Captain A:** <@{captains[0]}>", f"**Captain B:** <@{captains[1]}>"]
+    await sq_say(L, f"Teams Announced | {squad_format(L['size'])}", [caps, lines, [f"> Your ticket is ready: {channel.mention}"]], GREEN,
+                 top_text=" ".join(f"<@{u}>" for u in lobby_ids(L)),
+                 buttons=[discord.ui.Button(label="Open Ticket", url=channel.jump_url)])
+
+
+async def sq_say(L, title, text, accent, top_text=None, buttons=None):
+    try:
+        chan = bot.get_channel(L["channel_id"]) or await bot.fetch_channel(L["channel_id"])
+        sections = text if isinstance(text, list) else [text]
+        await chan.send(view=build_card(title, sections, accent=accent, top_text=top_text, buttons=buttons))
+    except discord.HTTPException as exc:
+        print(f"Could not post the squad announcement: {exc!r}")
+
+
+async def create_squad_ticket(guild: discord.Guild, L, teams, captains=None):
+    store.d["counters"]["squad"] = store.d["counters"].get("squad", 0) + 1
+    n = store.d["counters"]["squad"]
+    store.save()
+    name, vc_name = f"squad-{n:03d}", f"Squad {n:03d}"
+
+    cfg_g = gcfg(guild.id)
+    cat_id = cfg_g["cat"].get("tickets")
+    category = guild.get_channel(cat_id) if cat_id else None
+    if not isinstance(category, discord.CategoryChannel):
+        try:
+            staff_r = guild.get_role(STAFF_ROLE_ID) if STAFF_ROLE_ID else None
+            cat_ow = {guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                      guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True,
+                                                            connect=True, speak=True)}
+            if staff_r:
+                cat_ow[staff_r] = discord.PermissionOverwrite(view_channel=True, read_message_history=True)
+            category = await guild.create_category("TICKETS", overwrites=cat_ow, reason="Rivalz: tickets category was missing")
+            cfg_g["cat"]["tickets"] = category.id
+            store.save()
+        except discord.HTTPException as exc:
+            print(f"Could not recreate the tickets category: {exc!r}")
+            category = None
+
+    members = []
+    for team in teams:
+        for p in team:
+            members.append(guild.get_member(p["discord_id"]) or await guild.fetch_member(p["discord_id"]))
+    staff_role = guild.get_role(STAFF_ROLE_ID) if STAFF_ROLE_ID else None
+
+    text_ow = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True,
+                                              embed_links=True, read_message_history=True, attach_files=True),
+    }
+    for mem in members:
+        text_ow[mem] = discord.PermissionOverwrite(view_channel=True, send_messages=True,
+                                                   read_message_history=True, attach_files=True)
+    if staff_role:
+        text_ow[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+    channel = await guild.create_text_channel(
+        name, category=category, overwrites=text_ow,
+        topic=f"Squad {squad_format(L['size'])} #{n:03d} | lobby {L['id']}", reason="Rivalz squad ticket")
+
+    vc = None
+    try:
+        voice_ow = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            guild.me: discord.PermissionOverwrite(view_channel=True, connect=True, speak=True, manage_channels=True),
+        }
+        for mem in members:
+            voice_ow[mem] = discord.PermissionOverwrite(view_channel=True, connect=True, speak=True)
+        if staff_role:
+            voice_ow[staff_role] = discord.PermissionOverwrite(view_channel=True, connect=True, speak=True)
+        vc = await guild.create_voice_channel(vc_name, category=category, overwrites=voice_ow, reason="Rivalz squad voice channel")
+    except discord.HTTPException as exc:
+        print(f"Could not create the squad voice channel (give the bot Connect and Speak): {exc!r}")
+
+    st = {
+        "lobby": L["id"], "guild_id": guild.id, "channel_id": channel.id, "vc_id": vc.id if vc else None,
+        "number": n, "name": name, "size": L["size"], "pick": L["pick"], "rounds": L["rounds"], "server": L.get("server"),
+        "host": L["host"], "captains": captains, "created": int(time.time()), "status": "open",
+        "teams": [[dict(p) for p in team] for team in teams], "scores": [None, None],
+        "message_id": None, "ended_at": None, "ended_by": None,
+    }
+    try:
+        msg = await channel.send(view=squad_ticket_view(st, ping=True))
+    except Exception:
+        for ch_ in (channel, vc):     # do not leave empty channels behind when the card could not be sent
+            if ch_:
+                try:
+                    await ch_.delete(reason="Rivalz squad ticket failed")
+                except discord.HTTPException:
+                    pass
+        raise
+    st["message_id"] = msg.id
+    squad_tickets()[str(channel.id)] = st
+    store.save()
+    await squad_log(st, "Opened")
+    return channel, st
+
+
+async def squad_log(st, what: str):
+    try:
+        await send_cfg(st["guild_id"], "log", build_card(
+            f"Squad #{st['number']:03d} {what}",
+            [[field("Format", squad_format(st["size"])), field("Teams", SQUAD_PICK[st["pick"]]),
+              field("Rounds", rounds_text(st["rounds"])),
+              f"**Result:** `{esc(squad_result_text(st))}`" if what != "Opened" else f"**Opened:** <t:{st['created']}:F>"],
+             [f"-# Ticket: <#{st['channel_id']}>"]],
+            accent=SQUAD_COLOUR,
+            buttons=[discord.ui.Button(label="More Info", url=f"https://discord.com/channels/{st['guild_id']}/{st['channel_id']}")]))
+    except Exception as exc:
+        print(f"Squad log failed: {exc!r}")
+
+
+# ---------- squad ticket card
+def squad_side_of(st, uid):
+    for i, team in enumerate(st["teams"]):
+        if any(p["discord_id"] == uid for p in team):
+            return i
+    return None
+
+
+def squad_can_act(st, user) -> bool:
+    return squad_side_of(st, user.id) is not None or is_staff(user)
+
+
+def squad_scoreboard(st) -> str:
+    s0, s1 = st["scores"]
+
+    def f(s):
+        return "-" if s is None else str(s)
+
+    return f"**{SQUAD_TEAMS[0]}** `{f(s0)}` - `{f(s1)}` **{SQUAD_TEAMS[1]}**"
+
+
+def squad_result_text(st) -> str:
+    s0, s1 = st["scores"]
+    if s0 is None or s1 is None:
+        return "Not recorded"
+    if s0 > s1:
+        return f"{SQUAD_TEAMS[0]} wins"
+    if s1 > s0:
+        return f"{SQUAD_TEAMS[1]} wins"
+    return "Draw"
+
+
+def squad_ticket_view(st, ping=False):
+    status = st["status"]
+    view = discord.ui.LayoutView(timeout=None)
+    if ping:
+        view.add_item(discord.ui.TextDisplay(" ".join(f"<@{p['discord_id']}>" for team in st["teams"] for p in team)))
+    c = discord.ui.Container(accent_colour=SQUAD_COLOUR if status == "open" else GREY)
+    c.add_item(discord.ui.TextDisplay(f"## Squad Ticket #{st['number']:03d} | {squad_format(st['size'])}"))
+    caps = st.get("captains")
+    if caps:
+        c.add_item(discord.ui.TextDisplay(f"> **Captain A:** <@{caps[0]}>\n> **Captain B:** <@{caps[1]}>"))
+    for i, team in enumerate(st["teams"]):
+        c.add_item(discord.ui.Separator())
+        lines = [f"### {SQUAD_TEAMS[i]}"]
+        for p in team:
+            tag = " **(Captain)**" if caps and p["discord_id"] == caps[i] else ""
+            lines.append(f"> <@{p['discord_id']}> - [{md(p['roblox_name'])}]({profile_url(p)}){tag}")
+        c.add_item(discord.ui.TextDisplay("\n".join(lines)))
+        if status == "open":
+            row = discord.ui.ActionRow()
+            row.add_item(SquadTicketButton(f"s{i}"))
+            c.add_item(row)
+
+    info = ("### Match Info\n"
+            f"> **Mode:** `Squad {squad_format(st['size'])}`\n"
+            f"> **Teams:** `{SQUAD_PICK[st['pick']]}`\n"
+            f"> **Rounds:** `{rounds_text(st['rounds'])}`\n"
+            f"> **Status:** `{STATUS_TEXT.get(status, status.title())}`\n")
+    if status == "open":
+        info += f"> **Live Timer:** <t:{int(st['created'])}:R>\n> **Opened:** <t:{int(st['created'])}:t>"
+    else:
+        info += f"> **Duration:** `{fmt_duration((st.get('ended_at') or time.time()) - st['created'])}`"
+    if st.get("server"):
+        info += f"\n> **Server:** `{server_label(st['server'])} set`"
+    if st.get("vc_id"):
+        info += f"\n> **Voice:** <#{st['vc_id']}>"
+    c.add_item(discord.ui.Separator())
+    c.add_item(discord.ui.TextDisplay(info))
+    c.add_item(discord.ui.Separator())
+    c.add_item(discord.ui.TextDisplay(f"### Scoreboard\n> {squad_scoreboard(st)}"))
+    if status != "open":
+        c.add_item(discord.ui.Separator())
+        c.add_item(discord.ui.TextDisplay(f"### Result\n> `{esc(squad_result_text(st))}`"))
+    c.add_item(discord.ui.Separator())
+    c.add_item(discord.ui.TextDisplay(f"-# Squad opened by <@{st['host']}> | {SQUAD_PICK[st['pick']]} | {STATUS_TEXT.get(status, status.title())}"))
+
+    if status == "open":
+        buttons = [SquadTicketButton("join"), SquadTicketButton("prof"), SquadTicketButton("end")]
+    else:
+        buttons = [SquadTicketButton("prof"), SquadTicketButton("delete")]
+    vcu = f"https://discord.com/channels/{st['guild_id']}/{st['vc_id']}" if st.get("vc_id") else None
+    if vcu:
+        buttons.append(discord.ui.Button(label="Join VC", url=vcu))
+    add_buttons(c, buttons)
+    view.add_item(c)
+    return view
+
+
+async def refresh_squad_ticket(st):
+    try:
+        channel = bot.get_channel(st["channel_id"]) or await bot.fetch_channel(st["channel_id"])
+        await channel.get_partial_message(st["message_id"]).edit(view=squad_ticket_view(st))
+    except discord.HTTPException as exc:
+        print(f"Could not refresh the squad ticket card: {exc!r}")
+
+
+class SquadTicketButton(discord.ui.DynamicItem[discord.ui.Button], template=r"rv:sqt:(?P<act>join|prof|s0|s1|end|delete)"):
+    LOOK = {"join": ("Join", discord.ButtonStyle.success),
+            "prof": ("Profiles", discord.ButtonStyle.secondary),
+            "s0": ("Add Score: Team A", discord.ButtonStyle.primary),
+            "s1": ("Add Score: Team B", discord.ButtonStyle.primary),
+            "end": ("End", discord.ButtonStyle.danger),
+            "delete": ("Delete Ticket", discord.ButtonStyle.danger)}
+
+    def __init__(self, act: str):
+        label, style = self.LOOK[act]
+        super().__init__(discord.ui.Button(label=label, style=style, custom_id=f"rv:sqt:{act}"))
+        self.act = act
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        return cls(match["act"])
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        await safe_reply(interaction, "Something went wrong. Please try again.")
+        print(f"SquadTicketButton({self.act}) error: {error!r}")
+
+    async def callback(self, interaction: discord.Interaction):
+        st = squad_tickets().get(str(interaction.channel_id))
+        if not st:
+            return await safe_reply(interaction, "This squad ticket is no longer tracked by Rivalz.")
+        if not await guard(interaction, st["guild_id"]):
+            return
+        await SQUAD_HANDLERS[self.act](interaction, st)
+
+
+async def sqh_join(interaction, st):
+    if not squad_can_act(st, interaction.user):
+        return await notice(interaction, "Not Allowed", "> Only the players in this match can use the join link.")
+    if st["status"] != "open":
+        return await notice(interaction, "Match Ended", "> This match has already ended.")
+    srv = st.get("server")
+    roseal, roblox = server_urls(srv)
+    if not roblox:
+        return await notice(interaction, "No Server Link", "> This ticket has no server link.", accent=GREY)
+    host = next((p for team in st["teams"] for p in team if p["discord_id"] == st["host"]), None)
+    buttons = []
+    if roseal:
+        buttons.append(discord.ui.Button(label="Open Roseal", url=roseal))
+    buttons.append(discord.ui.Button(label="Open Roblox Directly", url=roblox))
+    who = f" from **{md(host['roblox_name'])}**" if host else ""
+    lines = [f"> Server link{who}."]
+    if roseal:
+        lines += ["> Tap **Open Roseal**. Roseal opens first and lets you pick how to launch Roblox.",
+                  "> If Roseal does not open, use **Open Roblox Directly**."]
+    else:
+        lines += ["> Tap **Open Roblox Directly** to launch Roblox.", "> Roseal is not available for private server links."]
+    await interaction.response.send_message(view=build_card(
+        "Join Match", [lines, [field("Server Type", server_label(srv))]], accent=GREEN, timeout=600, buttons=buttons), ephemeral=True)
+
+
+async def sqh_prof(interaction, st):
+    buttons = [discord.ui.Button(label=f"{p['roblox_name']}"[:80], url=profile_url(p)) for team in st["teams"] for p in team]
+    await interaction.response.send_message(view=build_card(
+        "Open Profile", ["> Choose whose Roblox profile you want to open."], buttons=buttons, timeout=600), ephemeral=True)
+
+
+class SquadScoreModal(discord.ui.Modal):
+    def __init__(self, cid: int, side: int, st):
+        super().__init__(title=f"Add Score: {SQUAD_TEAMS[side]}", timeout=600)
+        self.cid, self.side = cid, side
+        self.add_item(discord.ui.TextDisplay(
+            "**Add your team's score honestly.**\n"
+            "Enter only the rounds your team won. Each team adds its own score. Fake or inflated scores can get you blacklisted from Rivalz."))
+        current = st["scores"][side]
+        self.score = discord.ui.TextInput(placeholder=f"0 to {st['rounds']}", default=None if current is None else str(current),
+                                          min_length=1, max_length=3)
+        self.add_item(discord.ui.Label(
+            text="Team Score",
+            description=f"First to {st['rounds']} ({max_total_rounds(st['rounds'])} rounds at most). Rounds your team won."[:100],
+            component=self.score))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        st = squad_tickets().get(str(self.cid))
+        if not st or st["status"] != "open":
+            return await notice(interaction, "Match Ended", "> Scores can no longer be changed.")
+        raw = self.score.value.strip()
+        rounds = st["rounds"]
+        if not raw.isdigit() or int(raw) > rounds:
+            return await notice(interaction, "Invalid Score", f"> Enter a whole number from `0` to `{rounds}` (first to {rounds}).")
+        value, other = int(raw), st["scores"][1 - self.side]
+        most = max_total_rounds(rounds)
+        if other is not None and value + other > most:
+            st["scores"] = [None, None]
+            store.save()
+            await notice(interaction, "Scores Reset",
+                         [f"> Both scores add up to `{value + other}` rounds, but a **first to {rounds}** match lasts `{most}` rounds at most.",
+                          "> Both scores were reset. Add them again honestly."], accent=RED)
+            return await refresh_squad_ticket(st)
+        st["scores"][self.side] = value
+        store.save()
+        await interaction.response.send_message(view=build_card(
+            "Score Saved", [[field(f"{SQUAD_TEAMS[self.side]} Score", value), f"> {squad_scoreboard(st)}"]], accent=GREEN), ephemeral=True)
+        await refresh_squad_ticket(st)
+        try:
+            await interaction.channel.send(view=build_card(
+                "Score Recorded", [f"> **{SQUAD_TEAMS[self.side]}** added their score."], accent=GREY))
+        except discord.HTTPException:
+            pass
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        await safe_reply(interaction, "Something went wrong. Please try again.")
+        print(f"SquadScoreModal error: {error!r}")
+
+
+async def sq_score(interaction, st, side):
+    if st["status"] != "open":
+        return await notice(interaction, "Match Ended", "> Scores can no longer be changed.")
+    mine = squad_side_of(st, interaction.user.id)
+    if is_owner(interaction.user):
+        pass                                   # the developer can add either team's score
+    elif mine is None:
+        return await notice(interaction, "Not Allowed", "> Only the players in this match can add a score.")
+    elif mine != side:
+        return await notice(interaction, "Not Your Score", f"> This button is for **{SQUAD_TEAMS[side]}**. You can only add your own team's score.")
+    await interaction.response.send_modal(SquadScoreModal(st["channel_id"], side, st))
+
+
+async def sqh_s0(interaction, st):
+    await sq_score(interaction, st, 0)
+
+
+async def sqh_s1(interaction, st):
+    await sq_score(interaction, st, 1)
+
+
+async def sqh_end(interaction, st):
+    if not squad_can_act(st, interaction.user):
+        return await notice(interaction, "Not Allowed", "> Only the players in this match can end it.")
+    if st["status"] != "open":
+        return await notice(interaction, "Already Ended", "> This match has already ended.")
+    n, s = st["rounds"], st["scores"]
+    for i in (0, 1):     # first to N: a team that added N has won even if the other never added a score
+        if s[i] is not None and s[i] >= n and s[1 - i] is None:
+            s[1 - i] = 0
+    if None in s and not is_staff(interaction.user):
+        return await notice(interaction, "Scores Missing", "> Both teams must add their score before the match can end.")
+    st["status"] = "ended"
+    st["ended_at"] = int(time.time())
+    st["ended_by"] = interaction.user.id
+    store.save()
+    await interaction.response.edit_message(view=squad_ticket_view(st))
+    await squad_log(st, "Ended")
+
+
+async def sqh_delete(interaction, st):
+    if not squad_can_act(st, interaction.user):
+        return await notice(interaction, "Not Allowed", "> Only the players in this match or staff can delete this ticket.")
+    if st["status"] != "ended":
+        return await notice(interaction, "Not Ready", "> The match is not finished yet.")
+    await interaction.response.send_message(view=build_card(
+        "Ticket Deleting", ["> This ticket and its voice channel will be removed in `5` seconds."], accent=GREY))
+    guild = interaction.guild
+    squad_tickets().pop(str(st["channel_id"]), None)
+    store.save()
+    await asyncio.sleep(5)
+    if st.get("vc_id"):
+        vc = guild.get_channel(st["vc_id"])
+        if vc:
+            try:
+                await vc.delete(reason="Rivalz squad ticket deleted")
+            except discord.HTTPException:
+                pass
+    try:
+        await interaction.channel.delete(reason=f"Rivalz squad ticket deleted by {interaction.user}")
+    except discord.HTTPException:
+        pass
+
+
+SQUAD_HANDLERS = {"join": sqh_join, "prof": sqh_prof, "s0": sqh_s0, "s1": sqh_s1, "end": sqh_end, "delete": sqh_delete}
+
+
+async def squad_expiry():
+    """Called every minute: lobbies that did not fill up in time are closed."""
+    try:
+        now = time.time()
+        for L in list(squad_lobbies().values()):
+            if L["status"] == "open" and L["expires"] <= now:
+                L["status"] = "expired"
+                store.save()
+                await refresh_lobby(L)
+        for lid, L in list(squad_lobbies().items()):     # keep the table small: closed lobbies are dropped after a day
+            if L["status"] in ("cancelled", "expired", "started") and now - L["created"] > 86400:
+                squad_lobbies().pop(lid, None)
+        store.save()
+    except Exception as exc:
+        print(f"Squad expiry error: {exc!r}")
+
+
+# ---------- setup screen: a game-mode style card picker (panel -> Squad Up)
+# One private screen: captain profile + basic details, a card image (Manual / Random / your format), then the team size
+# and "first to" dropdowns (like Duel and Spar) and the two mode buttons. The last form only asks for the username,
+# the players (manual) or friends (random) and the server link.
+def render_squad_card(size, rounds, cap_name) -> bytes:
+    from PIL import Image, ImageDraw, ImageFilter
+    W, H = 1000, 400
+    img = Image.new("RGBA", (W, H))
+    px = ImageDraw.Draw(img)
+    for y in range(H):                                   # night-blue gradient
+        t = y / (H - 1)
+        px.line([(0, y), (W, y)], fill=(int(8 + 8 * t), int(16 + 26 * t), int(42 + 52 * t), 255))
+    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    g = ImageDraw.Draw(glow)
+    g.ellipse((-120, 120, 360, 520), fill=(40, 120, 255, 120))
+    g.ellipse((560, -160, 1060, 260), fill=(255, 60, 90, 70))
+    g.ellipse((380, 220, 880, 560), fill=(30, 200, 220, 70))
+    img.alpha_composite(glow.filter(ImageFilter.GaussianBlur(70)))
+    d = ImageDraw.Draw(img)
+
+    # title with a lightning bolt, slanted like the game's menu headers
+    d.polygon([(46, 70), (86, 28), (74, 58), (104, 58), (60, 104), (72, 74)], fill=(30, 150, 255, 255))
+    layer = Image.new("RGBA", (460, 100), (0, 0, 0, 0))
+    ImageDraw.Draw(layer).text((10, 8), "SQUAD UP", font=lb_font("bold", 62), fill=(236, 240, 247, 255))
+    layer = layer.transform(layer.size, Image.AFFINE, (1, 0.28, -14, 0, 1, 0), resample=Image.BICUBIC)
+    img.alpha_composite(layer, (116, 20))
+
+    # captain chip (top right)
+    chip = (668, 28, 960, 88)
+    d.rounded_rectangle(chip, radius=6, fill=(226, 232, 238, 255))
+    d.rectangle((chip[0], chip[1], chip[0] + 8, chip[3]), fill=(30, 150, 255, 255))
+    d.text((chip[0] + 24, chip[1] + 11), "CAPTAIN A", font=lb_font("bold", 14), fill=(90, 110, 130, 255))
+    f, nm = _fit_text(d, cap_name, "bold", 24, chip[2] - chip[0] - 44, min_size=14)
+    d.text((chip[0] + 24, chip[1] + 29), nm, font=f, fill=(16, 24, 40, 255))
+
+    def card(x, y, w, h, top_h, top_fill):
+        d.rounded_rectangle((x, y, x + w, y + h), radius=8, fill=(236, 238, 242, 255))
+        d.rounded_rectangle((x, y, x + w, y + top_h), radius=8, fill=top_fill)
+        d.rectangle((x, y + top_h - 10, x + w, y + top_h), fill=top_fill)
+        ring = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        cx, cy, r = x + w // 2, y + top_h // 2, min(w, top_h) // 2 - 12
+        ImageDraw.Draw(ring).ellipse((cx - r, cy - r, cx + r, cy + r), outline=(255, 255, 255, 70), width=3)
+        img.alpha_composite(ring)
+        return cx, cy
+
+    def person(cx, cy, s, colour):
+        d.ellipse((cx - s * 0.32, cy - s * 0.95, cx + s * 0.32, cy - s * 0.31), fill=colour)
+        d.pieslice((cx - s * 0.62, cy - s * 0.25, cx + s * 0.62, cy + s * 0.95), 180, 360, fill=colour)
+
+    def text_block(x, y, w, title, sub, sub_colour, desc):
+        f1, t1 = _fit_text(d, title, "bold", 21, w - 28, min_size=14)
+        d.text((x + w // 2, y), t1, font=f1, fill=(16, 22, 38, 255), anchor="mt")
+        f2, t2 = _fit_text(d, sub, "bold", 16, w - 28, min_size=11)
+        d.text((x + w // 2, y + 32), t2, font=f2, fill=sub_colour, anchor="mt")
+        for i, line in enumerate(desc):
+            d.text((x + w // 2, y + 62 + i * 20), line, font=lb_font("medium", 14), fill=(60, 70, 85, 255), anchor="mt")
+
+    top, h, tp = 112, 268, 150
+    # Manual selection
+    x, w = 40, 330
+    cx, cy = card(x, top, w, h, tp, (28, 140, 255, 255))
+    for k, dx in enumerate((-112, -56)):
+        person(cx + dx, cy + 26, 52, (14, 30, 70, 255))
+    for k, dx in enumerate((56, 112)):
+        person(cx + dx, cy + 26, 52, (10, 70, 90, 255))
+    d.text((cx, cy - 6), "VS", font=lb_font("bold", 24), fill=(255, 255, 255, 255), anchor="mm")
+    text_block(x, top + tp + 18, w, "MANUAL SELECTION", "YOU PICK BOTH TEAMS", (28, 140, 255, 255),
+               ["Choose every player for your team", "and for the other team."])
+    # Random matchmaking
+    x = 390
+    cx, cy = card(x, top, w, h, tp, (30, 190, 160, 255))
+    d.rounded_rectangle((cx - 42, cy - 42, cx + 42, cy + 42), radius=14, fill=(12, 40, 60, 255))
+    for ox, oy in ((-22, -22), (22, -22), (0, 0), (-22, 22), (22, 22)):
+        d.ellipse((cx + ox - 7, cy + oy - 7, cx + ox + 7, cy + oy + 7), fill=(255, 255, 255, 255))
+    for sgn in (-1, 1):                                  # shuffle arrows either side of the dice
+        ax = cx + sgn * 78
+        d.polygon([(ax + sgn * 18, cy), (ax, cy - 16), (ax, cy + 16)], fill=(255, 255, 255, 230))
+    text_block(x, top + tp + 18, w, "RANDOM MATCHMAKING", "FAIR SPLIT", (24, 170, 140, 255),
+               ["Open a lobby with a Join button.", "The bot splits everyone equally."])
+    # your format
+    x, w3 = 740, 220
+    cx, cy = card(x, top, w3, h, tp, (255, 110, 40, 255))
+    big = f"{size}V{size}" if size else "?V?"
+    d.text((cx, cy - 6), big, font=lb_font("bold", 52), fill=(255, 255, 255, 255), anchor="mm")
+    d.text((cx, cy + 34), f"{size * 2} PLAYERS" if size else "PICK A SIZE", font=lb_font("bold", 16), fill=(255, 235, 220, 255), anchor="mm")
+    ty = top + tp + 18
+    d.text((x + w3 // 2, ty), "YOUR FORMAT", font=lb_font("bold", 21), fill=(16, 22, 38, 255), anchor="mt")
+    d.text((x + w3 // 2, ty + 32), f"FIRST TO {rounds}", font=lb_font("bold", 16), fill=(230, 90, 20, 255), anchor="mt")
+    d.text((x + w3 // 2, ty + 62), "Change it with the", font=lb_font("medium", 14), fill=(60, 70, 85, 255), anchor="mt")
+    d.text((x + w3 // 2, ty + 82), "dropdowns below.", font=lb_font("medium", 14), fill=(60, 70, 85, 255), anchor="mt")
+
+    out = io.BytesIO()
+    img.convert("RGB").save(out, "PNG", optimize=True)
+    return out.getvalue()
+
+
+async def squad_new_state(user) -> dict:
+    prof = roblox_of(user.id)
+    thumb = user.display_avatar.url
+    if prof:
+        try:
+            urls = await bot.roblox.avatars([prof["roblox_id"]])
+            thumb = urls.get(prof["roblox_id"]) or thumb
+        except Exception:
+            pass
+    return {"owner_id": user.id, "origin": None, "size": None, "rounds": 3, "n": 0, "prof": prof, "thumb": thumb,
+            "cap_name": (prof or {}).get("roblox_name") or "Username not set", "cap_display": user.display_name}
+
+
+async def squad_setup_payload(state: dict):
+    png = await asyncio.to_thread(render_squad_card, state["size"], state["rounds"], state["cap_name"])
+    state["n"] += 1
+    name = f"squad_{state['n']}.png"
+    return SquadSetupView(state, name), discord.File(io.BytesIO(png), filename=name)
+
+
+async def squad_edit(interaction: discord.Interaction, state: dict):
+    view, file = await squad_setup_payload(state)
+    await interaction.response.edit_message(view=view, attachments=[file])
+
+
+class SquadSizeSelect(discord.ui.Select):
+    def __init__(self, state):
+        size = state["size"]
+        options = [discord.SelectOption(label=f"{n}v{n}", value=str(n), description=f"{n} players per team.", default=size == n)
+                   for n in (2, 3, 5)]
+        custom = size is not None and size not in (2, 3, 5)
+        options.append(discord.SelectOption(label=f"Custom ({size}v{size})" if custom else "Custom", value="custom",
+                                            description=f"Type your own team size ({SQUAD_MIN} to {SQUAD_MAX}).", default=custom))
+        super().__init__(placeholder="Select the team size...", options=options)
+        self.state = state
+
+    async def callback(self, interaction: discord.Interaction):
+        if self.values[0] == "custom":
+            return await interaction.response.send_modal(SquadNumberModal(self.state, "size"))
+        self.state["size"] = int(self.values[0])
+        await squad_edit(interaction, self.state)
+
+
+class SquadRoundsSelect(discord.ui.Select):
+    def __init__(self, state):
+        rounds = state["rounds"]
+        options = [
+            discord.SelectOption(label="First to 1", value="1", description="Single deciding round.", default=rounds == 1),
+            discord.SelectOption(label="First to 3", value="3", description="First team to win 3 rounds (5 rounds at most).", default=rounds == 3),
+            discord.SelectOption(label="First to 5", value="5", description="First team to win 5 rounds (9 rounds at most).", default=rounds == 5),
+        ]
+        custom = rounds not in (1, 3, 5)
+        options.append(discord.SelectOption(label=f"Custom (first to {rounds})" if custom else "Custom", value="custom",
+                                            description="Type your own number next.", default=custom))
+        super().__init__(placeholder="Select first to how many rounds...", options=options)
+        self.state = state
+
+    async def callback(self, interaction: discord.Interaction):
+        if self.values[0] == "custom":
+            return await interaction.response.send_modal(SquadNumberModal(self.state, "rounds"))
+        self.state["rounds"] = int(self.values[0])
+        await squad_edit(interaction, self.state)
+
+
+class SquadNumberModal(discord.ui.Modal):
+    """Custom team size or custom first-to number."""
+    def __init__(self, state, kind: str):
+        super().__init__(title="Custom Team Size" if kind == "size" else "Custom Rounds", timeout=600)
+        self.state, self.kind = state, kind
+        lo, hi = (SQUAD_MIN, SQUAD_MAX) if kind == "size" else (1, MAX_ROUNDS)
+        self.lo, self.hi = lo, hi
+        self.value = discord.ui.TextInput(placeholder=f"{lo} to {hi}", min_length=1, max_length=3)
+        self.add_item(discord.ui.Label(
+            text="Players Per Team" if kind == "size" else "First To",
+            description="5 means a 5v5 match (10 players)." if kind == "size" else "Rounds a team must win first.",
+            component=self.value))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = self.value.value.strip()
+        if not raw.isdigit() or not (self.lo <= int(raw) <= self.hi):
+            return await notice(interaction, "Invalid Number", f"> Enter a whole number from `{self.lo}` to `{self.hi}`.")
+        await interaction.response.defer(ephemeral=True)
+        self.state[self.kind] = int(raw)
+        view, file = await squad_setup_payload(self.state)
+        try:
+            await self.state["origin"].edit_original_response(view=view, attachments=[file])
+            await interaction.delete_original_response()
+        except (discord.HTTPException, AttributeError):
+            await interaction.followup.send(view=view, file=file, ephemeral=True)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        await safe_reply(interaction, "Something went wrong. Please try again.")
+        print(f"SquadNumberModal error: {error!r}")
+
+
+class SquadSetupView(discord.ui.LayoutView):
+    def __init__(self, state: dict, filename: str):
+        super().__init__(timeout=600)
+        self.state = state
+        size, rounds = state["size"], state["rounds"]
+        c = discord.ui.Container(accent_colour=SQUAD_COLOUR)
+        gallery = discord.ui.MediaGallery()
+        gallery.add_item(media=f"attachment://{filename}")
+        c.add_item(gallery)
+        prof = state.get("prof")
+        head = (f"### [{md(prof['roblox_display'])}]({profile_url(prof)}) (`@{esc(prof['roblox_name'])}`)" if prof
+                else f"### {md(state['cap_display'])}")
+        details = (f"{head}\n"
+                   f"> **Captain A:** <@{state['owner_id']}>\n"
+                   f"> **Team size:** {f'`{squad_format(size)}` ({size * 2} players)' if size else '`not chosen yet`'}\n"
+                   f"> **First to:** `{rounds}` (`{max_total_rounds(rounds)}` rounds at most)")
+        c.add_item(discord.ui.Section(discord.ui.TextDisplay(details), accessory=discord.ui.Thumbnail(state["thumb"])))
+        c.add_item(discord.ui.Separator())
+        c.add_item(discord.ui.TextDisplay("> Set the **team size** and **first to**, then pick **Manual selection** or **Random matchmaking**."))
+        row = discord.ui.ActionRow()
+        row.add_item(SquadSizeSelect(state))
+        c.add_item(row)
+        row_r = discord.ui.ActionRow()
+        row_r.add_item(SquadRoundsSelect(state))
+        c.add_item(row_r)
+        row2 = discord.ui.ActionRow()
+        for key, label, style in (("manual", "Manual selection", discord.ButtonStyle.primary),
+                                  ("random", "Random matchmaking", discord.ButtonStyle.success)):
+            b = discord.ui.Button(label=label, style=style)
+            b.callback = self._picker(key)
+            row2.add_item(b)
+        c.add_item(row2)
+        self.add_item(c)
+
+    def _picker(self, pick: str):
+        async def callback(interaction: discord.Interaction):
+            st = self.state
+            if not st["size"]:
+                return await notice(interaction, "Team Size Needed", "> Select the team size first (2v2, 3v3, 5v5 or Custom).", accent=GREY)
+            prof = store.d["profiles"].get(str(interaction.user.id), {})
+            await interaction.response.send_modal(SquadModal(pick, st["size"], st["rounds"], prof))
+        return callback
+
+
+class SquadModal(discord.ui.Modal):
+    def __init__(self, pick: str, size: int, rounds: int, prof: dict = None):
+        super().__init__(title=f"Squad {squad_format(size)} | First to {rounds} | {'Manual' if pick == 'manual' else 'Random'}"[:45], timeout=600)
+        self.pick, self.size, self.rounds = pick, size, rounds
+
+        self.username = discord.ui.TextInput(placeholder="Your Roblox username", default=(prof or {}).get("roblox_name") or None,
+                                             min_length=3, max_length=20)
+        self.add_item(discord.ui.Label(text="Roblox Username", description="Saved so you only type it once.", component=self.username))
+
+        if pick == "manual":
+            self.mates = discord.ui.UserSelect(placeholder=f"Select {size - 1} teammate(s)", min_values=size - 1, max_values=size - 1)
+            self.add_item(discord.ui.Label(text="Your Teammates", description=f"Team A: you plus {size - 1} more player(s).", component=self.mates))
+            self.enemies = discord.ui.UserSelect(placeholder=f"Select {size} opponent(s)", min_values=size, max_values=size)
+            self.add_item(discord.ui.Label(text="Enemy Team", description=f"Team B: exactly {size}. The first to accept is Captain B.", component=self.enemies))
+        else:
+            self.friends = discord.ui.UserSelect(placeholder="Pre-add friends (optional)", min_values=0,
+                                                 max_values=min(25, size * 2 - 1), required=False)
+            self.add_item(discord.ui.Label(text="Pre-add Friends (optional)",
+                                           description="They are pinged to join. Everyone else can join the lobby too.", component=self.friends))
+
+        self.server = discord.ui.TextInput(placeholder="Roseal / Roblox server link", min_length=10, max_length=400)
+        self.add_item(discord.ui.Label(text="Server Link", description="Your server link. Players join it from the ticket.", component=self.server))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        if not is_authorized(interaction.guild_id) and not is_owner(interaction.user):
+            return await notice(interaction, "Not Authorized", "> Rivalz is not authorized in this server yet.", accent=GREY)
+        server = parse_server_link(self.server.value)
+        if not server:
+            return await notice(interaction, "Invalid Server Link", [SERVER_HELP, "> Copy the link again and press **Squad Up** again."])
+
+        host = interaction.user
+        guild = interaction.guild
+        name = self.username.value.strip()
+        saved = store.d["profiles"].get(str(host.id), {})
+        if not (saved.get("roblox_id") and str(saved.get("roblox_name", "")).lower() == name.lower()):
+            rb = await bot.roblox.user_by_name(name)
+            if not rb:
+                return await notice(interaction, "Not Found", "> That Roblox username was not found.")
+            squad_save_profile(host.id, rb)
+
+        async def real_member(u):
+            if isinstance(u, discord.Member):
+                return u
+            try:
+                return await guild.fetch_member(u.id)
+            except discord.HTTPException:
+                return None
+
+        assigned, invited = None, []
+        if self.pick == "manual":
+            mates = list({u.id: u for u in self.mates.values}.values())
+            enemies = list({u.id: u for u in self.enemies.values}.values())
+            ids = [host.id] + [u.id for u in mates] + [u.id for u in enemies]
+            if len(mates) != self.size - 1 or len(enemies) != self.size or len(set(ids)) != self.size * 2:
+                return await notice(interaction, "Teams Not Valid",
+                                    [f"> A **{squad_format(self.size)}** needs {self.size - 1} teammate(s) and {self.size} opponent(s).",
+                                     "> Nobody can be picked twice, and you are already on your own team."])
+            for u in mates + enemies:
+                if u.bot:
+                    return await notice(interaction, "Teams Not Valid", "> You cannot pick a bot.")
+                if not await real_member(u):
+                    return await notice(interaction, "Teams Not Valid", f"> {u.mention} is not in this server.")
+            assigned = [[host.id] + [u.id for u in mates], [u.id for u in enemies]]
+        else:
+            for u in self.friends.values:
+                if u.id != host.id and not u.bot and u.id not in invited:
+                    invited.append(u.id)
+
+        cfg = {"size": self.size, "pick": self.pick, "server": server, "assigned": assigned, "invited": invited}
+        await create_lobby(interaction, cfg, self.rounds)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        await safe_reply(interaction, "Something went wrong. Please try again.")
+        print(f"SquadModal error: {error!r}")
+
+
+async def create_lobby(interaction: discord.Interaction, cfg: dict, rounds: int):
+    """interaction must already be deferred (ephemeral). Posts the lobby card with the host already joined."""
+    host = interaction.user
+    prof = roblox_of(host.id)
+    if not prof:
+        return await notice(interaction, "Username Needed", "> Enter your Roblox username and try again.")
+    if not is_owner(host):
+        for L in squad_lobbies().values():
+            if L["status"] in ("open", "starting") and (L["host"] == host.id or host.id in lobby_ids(L)):
+                return await notice(interaction, "Request Failed", "> You already have an open squad lobby. Finish or cancel it first.")
+    chan = interaction.channel      # the lobby channel when it belongs to this server, otherwise where Squad Up was started
+    if SQUAD_LOBBY_CHANNEL_ID:
+        try:
+            cand = bot.get_channel(SQUAD_LOBBY_CHANNEL_ID) or await bot.fetch_channel(SQUAD_LOBBY_CHANNEL_ID)
+            if getattr(getattr(cand, "guild", None), "id", None) == interaction.guild_id:
+                chan = cand
+        except discord.HTTPException:
+            pass
+    lid = uuid.uuid4().hex[:8]
+    L = {
+        "id": lid, "guild_id": interaction.guild_id, "channel_id": chan.id, "message_id": None,
+        "host": host.id, "size": cfg["size"], "pick": cfg["pick"], "rounds": rounds, "server": cfg["server"],
+        "assigned": cfg.get("assigned"), "invited": cfg.get("invited") or [], "captain_b": None,
+        "players": [{"discord_id": host.id, **prof}], "status": "open",
+        "created": time.time(), "expires": time.time() + EXPIRY_MINUTES * 60,
+    }
+    manual = L["pick"] == "manual"
+    pings = [] if manual else (cfg.get("invited") or [])          # manual rivals are invited in their DMs
+    if manual:
+        pings = [u for u in L["assigned"][0] if u != host.id]     # teammates are pinged in the lobby channel
+    top = ("Squad Up: " + " ".join(f"<@{u}>" for u in pings) + " press **Join** to play.") if pings else None
+    try:
+        msg = await chan.send(view=lobby_view(L, top_text=top))
+    except discord.HTTPException as exc:
+        print(f"Could not post the squad lobby: {exc!r}")
+        return await notice(interaction, "Request Failed", "> I could not post the lobby there. Check my Send Messages permission in the lobby channel.")
+    L["message_id"] = msg.id
+    squad_lobbies()[lid] = L
+    store.save()
+
+    undelivered = []
+    if manual:       # first to accept: every rival gets a DM invite, the first to press Accept is Captain B
+        for uid in L["assigned"][1]:
+            sent = None
+            try:
+                sent = await try_dm(await bot.fetch_user(uid), invite_view(L, host))
+            except discord.HTTPException:
+                pass
+            if not sent:
+                undelivered.append(uid)
+
+    lines = [f"> Your **{squad_format(L['size'])}** lobby is live in {chan.mention}.",
+             "> Players press **Join**. When it is full the teams are announced and the ticket opens."]
+    if manual:
+        lines.append("> You are **Captain A**. The first rival to press **Accept** in their DMs becomes **Captain B**.")
+    sections = [lines, [field("Teams", SQUAD_PICK[L["pick"]]), field("Rounds", rounds_text(rounds)),
+                        f"> Expires <t:{int(L['expires'])}:R>."]]
+    if undelivered:
+        sections.append(["> I could not DM " + ", ".join(f"<@{u}>" for u in undelivered) +
+                         " (DMs closed). They can press **Join** in the lobby instead, and the first rival in becomes Captain B."])
+    await interaction.followup.send(view=build_card(
+        "Lobby Opened", sections, accent=SQUAD_COLOUR, buttons=[discord.ui.Button(label="Open Lobby", url=msg.jump_url)]), ephemeral=True)
+
+
 # ============================================================ bot
 class GuardedTree(app_commands.CommandTree):
     """Every slash command is owner only, except /ping (it works for everyone, in any server)."""
@@ -3309,7 +4516,7 @@ def migrate_legacy():
             continue
         g = gcfg(guild.id)
         g["authorized"], g["legacy"] = True, True
-        for key in ("panel", "log", "results", "duel_lb", "streaks"):
+        for key in ("panel", "log", "results", "duel_lb", "spar_lb", "streaks"):
             if guild.get_channel(LEGACY[key]):
                 g["ch"][key] = LEGACY[key]
         g["cat"].update(main=LEGACY["cat_main"], tickets=LEGACY["cat_tickets"])
@@ -3331,7 +4538,8 @@ class Rivalz(commands.Bot):
         self.session = aiohttp.ClientSession()
         self.roblox = RobloxClient(self.session)
         self.add_dynamic_items(ChallengeButton, TicketButton, ReopenButton, OpenGankButton, LbButton, LbPage, LbSelect, LbJump,
-                               SpectateButton, LogSpectatorsButton, RemoveSpectatorButton)
+                               SpectateButton, LogSpectatorsButton, RemoveSpectatorButton,
+                               SquadLobbyButton, SquadTicketButton, SquadInviteButton)
         await self.tree.sync()
         expiry_loop.start()
 
@@ -3416,6 +4624,8 @@ class Rivalz(commands.Bot):
         await super().on_message(message)
 
     async def on_guild_channel_delete(self, channel):
+        if squad_tickets().pop(str(getattr(channel, "id", 0)), None) is not None:   # a squad ticket removed by hand
+            store.save()
         t = store.d["tickets"].get(str(getattr(channel, "id", 0)))
         if t and t.get("ongoing_msg"):  # a ticket removed by hand: take its live card down too
             await clear_ongoing(t)
@@ -3504,6 +4714,7 @@ async def expiry_loop():
                 accent=GREY))
         except discord.HTTPException:
             pass
+    await squad_expiry()   # squad lobbies that never filled up
 
 
 @expiry_loop.before_loop
@@ -3841,7 +5052,7 @@ def record_match(t) -> bool:
 
 
 # ============================================================ win streaks
-# A streak = decided matches won in a row without a loss (Duel).
+# A streak = decided matches won in a row without a loss. Duel and Spar each have their own streak (STREAK_MODES=duel,spar).
 # Nothing extra is stored: every streak is replayed from the saved matches, so the leaderboard data is never touched
 # and streaks that already exist in your history count straight away.
 #   * announcements at STREAK_MIN (10), then every STREAK_STEP (5): 10, 15, 20, 25 ...
@@ -3851,7 +5062,7 @@ def record_match(t) -> bool:
 STREAK_MIN = max(2, env_int("STREAK_MIN", 10))
 STREAK_STEP = max(1, env_int("STREAK_STEP", 5))
 STREAK_BREAK_BONUS = max(1, env_int("STREAK_BREAK_BONUS", 2))
-STREAK_MODES = ("duel",)
+STREAK_MODES = tuple(m for m in re.findall(r"[a-z]+", os.getenv("STREAK_MODES", "duel,spar").lower()) if m in LB_MODES) or ("duel",)
 STREAK_STYLES = {
     "line": ("STREAK ON THE LINE", 0xE74C3C),
     "one": ("ONE WIN AWAY", 0xF1C40F),
@@ -3924,7 +5135,7 @@ def streak_events(row, before, after):
             elif n > aw["prev_best"]:
                 out.append({"kind": "best", "n": n, "user": w, "prev": aw["prev_best"]})
             else:
-                out.append({"kind": "milestone", "n": n, "user": w, "victim": l, "lasted": row["ts"] - aw["start"]})
+                out.append({"kind": "milestone", "n": n, "user": w, "victim": l})
         else:
             nxt = next_milestone(a)
             if nxt - a == 1 and a > b:
@@ -3973,132 +5184,15 @@ def render_badge(number, colour: int) -> bytes:
     return out.getvalue()
 
 
-def render_rosette(number, colour: int) -> bytes:
-    """Award rosette with two ribbons in a flat comic style: scalloped edge, dark outline, offset white shadow."""
-    from PIL import Image, ImageDraw
-    rgb = ((colour >> 16) & 255, (colour >> 8) & 255, colour & 255)
-    ink, paper = (28, 28, 34, 255), (246, 246, 248, 255)
-    S, OUT = 1000, 200
-    im = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-    d = ImageDraw.Draw(im)
-    cx, cy = 500, 410
-    scallop = []
-    for i in range(720):
-        t = i * 2 * math.pi / 720
-        rad = 300 + 20 * math.cos(14 * t)
-        scallop.append((cx + rad * math.cos(t), cy + rad * math.sin(t)))
-
-    def tail(sign):   # sign +1 = left ribbon (leans left), -1 = right ribbon
-        a = math.radians(22 * sign)
-        ox, oy = cx - 120 * sign, cy + 200
-        out = []
-        for x, y in ((-70, 0), (70, 0), (70, 340), (0, 285), (-70, 340)):
-            out.append((ox + x * math.cos(a) - y * math.sin(a), oy + x * math.sin(a) + y * math.cos(a)))
-        return out
-
-    def draw(poly, fill, dx=0, dy=0):
-        pts = [(x + dx, y + dy) for x, y in poly]
-        d.polygon(pts, fill=fill)
-        d.line(pts + [pts[0]], fill=ink, width=14, joint="curve")
-
-    for poly in (tail(1), tail(-1), scallop):          # the white offset shadow behind everything
-        draw(poly, paper, 26, 26)
-    for poly in (tail(1), tail(-1), scallop):
-        draw(poly, rgb + (255,))
-    d.ellipse([cx - 225, cy - 225, cx + 225, cy + 225], fill=paper, outline=ink, width=12)
-    d.ellipse([cx - 185, cy - 185, cx + 185, cy + 185], fill=rgb + (255,), outline=ink, width=12)
-    txt = str(number)
-    d.text((cx, cy + 8), txt, font=lb_font("bold", 250 if len(txt) <= 2 else 190), fill=paper, anchor="mm",
-           stroke_width=12, stroke_fill=ink)
-    for sx, sy in ((120, 140), (880, 120), (890, 720), (100, 640)):   # small sparkle bursts
-        for ang in (0, 45, 90, 135):
-            dx, dy = 34 * math.cos(math.radians(ang)), 34 * math.sin(math.radians(ang))
-            d.line([(sx - dx, sy - dy), (sx + dx, sy + dy)], fill=ink, width=8)
-    out = io.BytesIO()
-    im.resize((OUT, OUT), Image.LANCZOS).save(out, "PNG")
-    return out.getvalue()
-
-
-ROSETTE_NUMBERS = (10, 15)   # these milestones use the rosette badge, every other number keeps the hexagon
-
-
-# Every streak card is two lines. Each kind has several texts that carry different information, and the next
-# card never repeats the text that kind used last. (min_n, needed values, text)
-STREAK_TEXTS = {
-    "milestone": [
-        (0, (), "{u} has won {n} matches in a row.\nNobody has been able to stop them yet."),
-        (0, (), "{u} is on a {n}-win streak.\nEvery opponent so far has fallen."),
-        (0, (), "{n} wins and counting for {u}.\nWho is going to be the one to stop them?"),
-        (0, ("nxt",), "{u} keeps on winning, {n} in a row now.\nThe next milestone is {nxt} wins."),
-        (0, ("v",), "{u} just beat {v} to reach {n} wins in a row.\nThe streak keeps growing."),
-        (0, ("v",), "{v} was the latest to fall to {u}.\nThat makes {n} wins without a loss."),
-        (0, ("span",), "{u} has gone {span} without losing.\n{n} wins in a row and still going."),
-        (20, (), "{u} is on a rampage with {n} wins in a row.\nIt is getting hard to see who can stop this."),
-        (30, (), "{n} wins in a row. {u} is dominating Rivalz.\nThis run is turning into history."),
-        (45, (), "{u} has not lost in {n} matches.\nThe whole server is watching this streak."),
-    ],
-    "one": [
-        (0, ("nxt",), "{u} is on {n} wins, one away from a {nxt}-win streak.\nTheir next match decides it."),
-        (0, ("nxt",), "One more win and {u} reaches {nxt} in a row.\nThey are sitting on {n} right now."),
-        (0, ("v", "nxt"), "{u} beat {v} and moved up to {n} wins.\nThe {nxt}-win mark is one match away."),
-        (0, ("nxt",), "{n} wins down for {u}, only one to go.\nCan anyone stop them before {nxt}?"),
-    ],
-    "best": [
-        (0, (), "{u} just set a new personal best with {n} wins in a row.\nAnd the streak is still going."),
-        (0, ("prev",), "{u} passed their own best of {prev} wins.\nThey are now at {n} and still going."),
-        (0, (), "{u} has never won this many in a row before.\n{n} wins and counting."),
-        (0, ("prev",), "The old personal best was {prev} wins.\n{u} just left it behind with {n} in a row."),
-    ],
-    "record": [
-        (0, (), "{u} now holds the longest streak in Rivalz.\n{n} wins in a row, and nobody has gone further."),
-        (0, ("prev",), "New server record: {u} with {n} wins in a row.\nThe old mark of {prev} has been passed."),
-        (0, ("h",), "{u} took the longest streak in Rivalz from {h}.\n{n} wins in a row and the record is theirs now."),
-        (0, (), "{u} is making history with {n} wins in a row.\nNo one in Rivalz has ever gone this far."),
-    ],
-    "ended": [
-        (0, (), "{w} ended {l}'s {n}-win streak.\nThe run is over."),
-        (0, ("span",), "{w} ended {l}'s {n}-win streak.\nIt lasted {span} before it came to an end."),
-        (0, (), "{l}'s run of {n} wins is over.\n{w} was the one who finally stopped it."),
-        (0, (), "{n} wins in a row, and then {w} showed up.\n{l}'s streak has ended."),
-        (0, ("span",), "{w} broke {l}'s streak at {n} wins.\nThat run lasted {span}."),
-    ],
-    "line": [
-        (0, (), "{h} is putting a {n}-win streak on the line against {o}.\nIf {o} wins, the run ends here."),
-        (0, (), "{o} has a chance to end {h}'s {n}-win streak.\nThe match is about to start."),
-        (0, (), "{n} wins in a row for {h}, and now {o} is next.\nThis match could end it."),
-        (0, (), "{o} is coming for {h}'s {n}-win streak.\nOne win and it is over."),
-        (0, ("acc_h",), "{h} accepted a challenge from {o} with a {n}-win streak on the line.\nOne loss ends the whole run."),
-        (0, ("chal_h",), "{h} challenged {o} while on a {n}-win streak.\nIf {o} wins, the streak is over."),
-    ],
-}
-STREAK_LAST = {}
-
-
-def pick_streak_text(kind, **kw) -> str:
-    n = kw.get("n", 0)
-    pool = [t for lo, need, t in STREAK_TEXTS[kind] if n >= lo and all(kw.get(k) for k in need)]
-    fresh = [t for t in pool if t != STREAK_LAST.get(kind)] or pool
-    text = random.choice(fresh)
-    STREAK_LAST[kind] = text
-    return text.format(**{k: ("" if v is None else v) for k, v in kw.items()})
-
-
-def mn(uid):
-    return f"<@{uid}>" if uid else None
-
-
-def span_text(seconds):
-    """A time span worth saying out loud (at least one hour), else None."""
-    return fmt_span(seconds) if seconds is not None and seconds >= 3600 else None
-
-
-async def send_streak_card(gid, kind, number, text):
+async def send_streak_card(gid, kind, number, main, small, mode=None):
     title, colour = STREAK_STYLES[kind]
-    make = render_rosette if number in ROSETTE_NUMBERS else render_badge
-    png = await asyncio.to_thread(make, number, colour)
+    if mode and len(STREAK_MODES) > 1:
+        small += f" · {MODES[mode]['name']}"
+    png = await asyncio.to_thread(render_badge, number, colour)
     view = discord.ui.LayoutView(timeout=None)
     c = discord.ui.Container(accent_colour=colour)
-    c.add_item(discord.ui.Section(discord.ui.TextDisplay(f"### {title}\n{text}"),
+    flame = "" if kind == "ended" else "🔥 "
+    c.add_item(discord.ui.Section(discord.ui.TextDisplay(f"### {flame}{title}\n{main}\n-# {small}"),
                                   accessory=discord.ui.Thumbnail("attachment://streak.png")))
     view.add_item(c)
     return await send_cfg(gid, "streaks", view, file=discord.File(io.BytesIO(png), filename="streak.png"))
@@ -4112,19 +5206,26 @@ async def post_streak_events(gid, mode, events):
     for ev in events:
         try:
             k, n = ev["kind"], ev["n"]
-            kw = {"n": n}
             if k == "ended":
-                kw.update(w=mn(ev["winner"]), l=mn(ev["loser"]), span=span_text(ev.get("lasted")))
+                await send_streak_card(
+                    gid, k, n, f"<@{ev['winner']}> ended <@{ev['loser']}>'s {n}-win streak.",
+                    f"Final streak: {wins_text(n)} · Lasted {fmt_span(ev['lasted'])} · Ended by <@{ev['winner']}> "
+                    f"· +{STREAK_BREAK_BONUS} streak", mode)
             elif k == "record":
-                holder = ev["holder"] if ev["holder"] and ev["holder"] != ev["user"] else None
-                kw.update(u=mn(ev["user"]), prev=ev["prev"] or None, h=mn(holder))
+                prev = f"{wins_text(ev['prev'])}" + (f", held by <@{ev['holder']}>" if ev["holder"] and ev["holder"] != ev["user"] else "") \
+                    if ev["prev"] else "none yet"
+                await send_streak_card(gid, k, n, f"<@{ev['user']}> now holds the longest streak in Rivalz.",
+                                       f"{wins_text(n)} · Previous record: {prev}", mode)
             elif k == "best":
-                kw.update(u=mn(ev["user"]), prev=ev["prev"] or None)
+                prev = wins_text(ev["prev"]) if ev["prev"] else "none"
+                await send_streak_card(gid, k, n, f"<@{ev['user']}> just set a new personal best: {n} wins in a row.",
+                                       f"Previous best: {prev} · The streak is still going", mode)
             elif k == "milestone":
-                kw.update(u=mn(ev["user"]), v=mn(ev.get("victim")), nxt=next_milestone(n), span=span_text(ev.get("lasted")))
+                await send_streak_card(gid, k, n, f"<@{ev['user']}> is on a {n}-win streak.",
+                                       "Keep it going" + (f" · Last victim: <@{ev['victim']}>" if ev.get("victim") else ""), mode)
             elif k == "one":
-                kw.update(u=mn(ev["user"]), nxt=ev["next"], v=mn(ev.get("victim")))
-            await send_streak_card(gid, k, n, pick_streak_text(k, **kw))
+                await send_streak_card(gid, k, n, f"<@{ev['user']}> is on {n} wins. One more reaches a {ev['next']}-win streak.",
+                                       "Their next match decides it" + (f" · Last victim: <@{ev['victim']}>" if ev.get("victim") else ""), mode)
         except Exception as exc:
             print(f"Could not post a streak card: {exc!r}")
         await asyncio.sleep(1)
@@ -4142,9 +5243,12 @@ async def announce_on_the_line(t):
             n = (table.get(holder) or {}).get("cur", 0)
             if n < STREAK_MIN:
                 continue
-            text = pick_streak_text("line", n=n, h=mn(holder), o=mn(other),
-                                    acc_h=(holder == p1) or None, chal_h=(holder == p0) or None)
-            await send_streak_card(t["guild_id"], "line", n, text)
+            if holder == p0:
+                main = f"<@{p1}> has accepted a match against <@{p0}>."
+            else:
+                main = f"<@{p1}> accepted a challenge from <@{p0}>."
+            await send_streak_card(t["guild_id"], "line", n, main,
+                                   f"<@{holder}> is on a {n}-win streak. If <@{other}> wins, the run ends here.", mode)
     except Exception as exc:
         print(f"Streak on the line error: {exc!r}")
 
@@ -4165,17 +5269,25 @@ async def apply_manual_streak(gid, mode, uid, dw, dl):
     return events
 
 
-def streak_card(uid: int, modes=None, mention: bool = True):
-    """Streak Status: the member on top, then the Duel streak (current, best, next milestone)."""
-    blocks = [f"> <@{uid}>"]
+def streak_card(uid: int, modes=None, mention: bool = False):
+    blocks = []
+    if mention:
+        blocks.append(f"<@{uid}>")
     for mode in (modes or STREAK_MODES):
-        me = streak_table(mode).get(uid) or {"cur": 0, "best": 0}
+        table = streak_table(mode)
+        me = table.get(uid) or {"cur": 0, "best": 0, "victim": None, "start": 0}
+        rec_n, rec_u = max(((u["best"], x) for x, u in table.items()), default=(0, None))
         cur = me["cur"]
         nxt = next_milestone(cur)
-        blocks.append("\n".join([f"**{MODES[mode]['name']}**",
-                                 f"> **Current streak:** {wins_text(cur)}",
-                                 f"> **Best streak:** {wins_text(me['best'])}",
-                                 f"> **Next milestone:** {nxt} wins ({nxt - cur} to go)"]))
+        lines = [f"**{MODES[mode]['name']}**",
+                 f"> **Current streak:** {wins_text(cur)}" + (" 🔥" if cur >= STREAK_MIN else ""),
+                 f"> **Best streak:** {wins_text(me['best'])}",
+                 f"> **Next milestone:** {nxt} wins ({nxt - cur} to go)"]
+        if cur and me["victim"]:
+            lines.append(f"> **Last victim:** <@{me['victim']}>")
+        if rec_n:
+            lines.append(f"> **Server record:** {wins_text(rec_n)}" + (f" by <@{rec_u}>" if rec_u else ""))
+        blocks.append("\n".join(lines))
     view = discord.ui.LayoutView(timeout=None)
     c = discord.ui.Container(accent_colour=0xE67E22)
     c.add_item(discord.ui.TextDisplay("## Streak Status\n" + "\n\n".join(blocks)))   # one text block, no divider lines
@@ -4224,7 +5336,7 @@ def message_text(components) -> str:
 
 def parse_result(text):
     """A final (closed) result card -> one match row, or None (live cards, draws and 'not recorded' are skipped)."""
-    title = re.search(r"(Duel) #(\d+) Result", text)
+    title = re.search(r"(Duel|Spar) #(\d+) Result", text)
     if not title or "This match is closed" not in text:
         return None
     win = re.search(r"\*\*Winner:\*\* <@!?(\d+)>", text)
@@ -4371,7 +5483,7 @@ async def board_message(guild, mode, period, page=1, highlight=None):
 
 
 # ============================================================ leaderboard message: dropdown (with My Rank), pages
-class LbSelect(discord.ui.DynamicItem[discord.ui.Select], template=r"rv:lbsel:(?P<mode>duel)(?::(?P<page>\d+))?"):
+class LbSelect(discord.ui.DynamicItem[discord.ui.Select], template=r"rv:lbsel:(?P<mode>duel|spar)(?::(?P<page>\d+))?"):
     """The dropdown at the top: Daily / Weekly / All-time."""
     def __init__(self, mode, period="all", page=1):
         super().__init__(discord.ui.Select(
@@ -4406,7 +5518,7 @@ class LbSelect(discord.ui.DynamicItem[discord.ui.Select], template=r"rv:lbsel:(?
         await interaction.edit_original_response(view=view, attachments=files)
 
 
-class LbButton(discord.ui.DynamicItem[discord.ui.Button], template=r"rv:lbme:(?P<mode>duel)"):
+class LbButton(discord.ui.DynamicItem[discord.ui.Button], template=r"rv:lbme:(?P<mode>duel|spar)"):
     """Small My Rank button at the top of the board (answers privately, the board is not touched)."""
     def __init__(self, mode):
         super().__init__(discord.ui.Button(label="My Rank", style=discord.ButtonStyle.secondary,
@@ -4441,7 +5553,7 @@ class LbButton(discord.ui.DynamicItem[discord.ui.Button], template=r"rv:lbme:(?P
             pass
 
 
-class LbPage(discord.ui.DynamicItem[discord.ui.Button], template=r"rv:lbpg:(?P<mode>duel):(?P<page>\d+):(?P<slot>[a-z0-9]+)"):
+class LbPage(discord.ui.DynamicItem[discord.ui.Button], template=r"rv:lbpg:(?P<mode>duel|spar):(?P<page>\d+):(?P<slot>[a-z0-9]+)"):
     """Page buttons under the board: < 1 2 3 >"""
     def __init__(self, mode, target, slot, label=None, current=False, disabled=False):
         super().__init__(discord.ui.Button(
@@ -4479,7 +5591,7 @@ def page_range_text(n: int) -> str:
     return f"Ranks 1-{LB_PAGE}" if n == 1 else f"Ranks {(n - 1) * LB_PAGE + 1}-{n * LB_PAGE}"
 
 
-class LbJump(discord.ui.DynamicItem[discord.ui.Select], template=r"rv:lbjump:(?P<mode>duel):(?P<page>\d+)"):
+class LbJump(discord.ui.DynamicItem[discord.ui.Select], template=r"rv:lbjump:(?P<mode>duel|spar):(?P<page>\d+)"):
     """Dropdown under the board: pick any page (1, 2, 3 ...) and go straight there."""
     def __init__(self, mode, page=1, pages=1):
         super().__init__(discord.ui.Select(
@@ -4588,7 +5700,7 @@ LB_SIG = {}  # what each channel's board last showed, so an unchanged board is n
 
 
 async def refresh_leaderboards(guild, repost=False):
-    """Posts a fresh Duel board in its channel and removes the previous one. A board that has not
+    """Posts a fresh Duel and Spar board in their channels and removes the previous one. A board that has not
     changed since it was last posted is left alone (so there is no pointless delete + repost)."""
     cfg = gcfg(guild.id)
     for mode in LB_MODES:
@@ -4771,13 +5883,14 @@ async def build_guild(guild):
 
     # Category 1: the 5 base channels
     main = await category("main", "RIVALZ", {})
-    await text("panel", "matchmaking", main, read_only, "Start a Duel from here.")
+    await text("panel", "matchmaking", main, read_only, "Start a Duel or Spar from here.")
     await text("results", "results", main, read_only, "Finished match results.")
     await text("log", "match-logs", main, private, "Rivalz ticket logs (staff only).")
     await text("duel_lb", "duel-leaderboard", main, read_only, "Duel leaderboard, ranked by wins.")
+    await text("spar_lb", "spar-leaderboard", main, read_only, "Spar leaderboard, ranked by wins.")
     # Ongoing-Ping: the channel that announces live matches + the role that gets pinged for them
     adopt_legacy_extras(guild)  # your original server keeps its existing channel and role
-    await text("ongoing", "ongoing-ping", main, read_only, "Live Duels. Join as a spectator to watch.", move=False)
+    await text("ongoing", "ongoing-ping", main, read_only, "Live Duels and Spars. Join as a spectator to watch.", move=False)
     # Streak announcements (10, 15, 20 ... wins in a row). Your original server keeps its own streaks channel.
     await text("streaks", "streaks", main, read_only, "Win streak announcements: 10, 15, 20 wins in a row and every 5 after.", move=False)
     roles = cfg["role"]
@@ -4793,7 +5906,7 @@ async def build_guild(guild):
         orole = await guild.create_role(name="Ongoing Ping", mentionable=True, reason="Rivalz /build")
         roles["ongoing"] = orole.id
         created.append(f"Role {orole.mention}")
-    # Category 2: tickets (every Duel ticket is created in here)
+    # Category 2: tickets (every Duel/Spar ticket is created in here)
     await category("tickets", "TICKETS", private)
     # An old LEADERBOARDS category from the previous layout is removed once it is empty
     old_lb = guild.get_channel(cats["lb"]) if cats.get("lb") else None
@@ -5138,20 +6251,21 @@ async def backup_cmd(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="addmatch", description="Owner only: add one past result to the global leaderboard.")
-@app_commands.describe(winner="Who won", loser="Who lost", days_ago="How many days ago it happened (default 0)")
-async def addmatch(interaction: discord.Interaction, winner: discord.User,
+@app_commands.describe(mode="Duel or Spar", winner="Who won", loser="Who lost", days_ago="How many days ago it happened (default 0)")
+@app_commands.choices(mode=[app_commands.Choice(name="Duel", value="duel"), app_commands.Choice(name="Spar", value="spar")])
+async def addmatch(interaction: discord.Interaction, mode: app_commands.Choice[str], winner: discord.User,
                    loser: discord.User, days_ago: app_commands.Range[int, 0, 3650] = 0):
     if not is_owner(interaction.user):
         return await interaction.response.send_message("Owner only.", ephemeral=True)
     if winner.id == loser.id:
         return await notice(interaction, "Invalid", "> The winner and loser must be different people.")
     await interaction.response.defer(ephemeral=True)
-    lbstore.d["matches"].append({"g": interaction.guild_id or 0, "m": "duel", "n": -int(time.time() * 1000),
+    lbstore.d["matches"].append({"g": interaction.guild_id or 0, "m": mode.value, "n": -int(time.time() * 1000),
                                  "ts": int(time.time()) - days_ago * 86400, "w": winner.id, "l": loser.id, "ws": 0, "ls": 0})
     lbstore.save()
     schedule_lb_refresh()
     await notice(interaction, "Match Added",
-                 [f"> **Duel:** {winner.mention} beat {loser.mention}", "> The board refreshes in a few seconds."],
+                 [f"> **{mode.name}:** {winner.mention} beat {loser.mention}", "> The boards refresh in a few seconds."],
                  accent=GREEN)
 
 
@@ -5192,11 +6306,11 @@ async def update_cmd(interaction: discord.Interaction):
 @bot.tree.command(name="help", description="See what Rivalz can do.")
 async def help_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(view=build_card("Rivalz Help", [
-        [f"> Challenge rivals to a **Duel** from the matchmaking panel. First to the chosen rounds wins."],
+        [f"> Challenge rivals to a **Duel** or **Spar** from the matchmaking panel. First to the chosen rounds wins."],
         ["`/ping` - check that Rivalz is online (everyone)",
-         "`/member stats [member]` - Duel stats of yourself or any member. Also `.member stats`, `?member stats` (everyone)",
-         "`/streak [member]` - win streak status: current, best and next milestone (everyone)",
-         "`/set count d` - set a player's leaderboard count (developer only)",
+         "`/member stats [member]` - Overall stats with Duel and Spar buttons. Also `.member stats`, `?member stats` (everyone)",
+         "`/streak [member]` - win streak status: current, best, next milestone, server record (everyone)",
+         "`/set count d`, `/set count s` - set a player's leaderboard count (developer only)",
          "`/rank`, `/panel`, `/authorize`, `/build`, `/update`, `/backup`, `/deauthorize` ... - owner only"],
         ["> You can also start a message with **R** or **Rivalz**: `R ping`, `R leaderboard`, `R top 3`, `R rank`, `R open general`, "
          "`R open Divisions category`, `R channels`.",
@@ -5206,7 +6320,7 @@ async def help_cmd(interaction: discord.Interaction):
     ], accent=GREY), ephemeral=True)
 
 
-@bot.tree.command(name="rank", description="See your global Duel rank.")
+@bot.tree.command(name="rank", description="See your global Duel and Spar rank.")
 async def rank_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     uid = interaction.user.id
@@ -5222,12 +6336,15 @@ async def rank_cmd(interaction: discord.Interaction):
     await interaction.followup.send(view=build_card("Your Rank (All-time)", sections, accent=GREEN), ephemeral=True)
 
 
-@bot.tree.command(name="streak", description="Check a win streak (yours by default): current, best and next milestone.")
-@app_commands.describe(member="Whose streak to check (default: you)")
-async def streak_cmd(interaction: discord.Interaction, member: discord.User = None):
+@bot.tree.command(name="streak", description="Check a win streak (yours by default): current, best and the server record.")
+@app_commands.describe(member="Whose streak to check (default: you)", mode="Duel or Spar (default: the streak mode)")
+@app_commands.choices(mode=[app_commands.Choice(name="Duel", value="duel"), app_commands.Choice(name="Spar", value="spar")])
+async def streak_cmd(interaction: discord.Interaction, member: discord.User = None, mode: app_commands.Choice[str] = None):
     target = member or interaction.user
     await interaction.response.defer()
-    await interaction.followup.send(view=streak_card(target.id), allowed_mentions=NO_PING)
+    await interaction.followup.send(
+        view=streak_card(target.id, [mode.value] if mode else None, mention=target.id != interaction.user.id),
+        allowed_mentions=NO_PING)
 
 
 # ============================================================ /member stats  (also  .member stats  ?member stats)
@@ -5246,7 +6363,7 @@ def win_rate_text(w: int, l: int) -> str:
 
 
 def overall_rows():
-    """Duel all-time (global), ranked like a leaderboard."""
+    """Duel + Spar added together (all-time, global), ranked like a leaderboard."""
     tally = {}
     for mode in LB_MODES:
         for uid, w, l in standings(mode, "all"):
@@ -5264,8 +6381,9 @@ def stats_for(uid: int, view: str):
 
 
 class StatsView(discord.ui.LayoutView):
-    """Member stats card (Duel)."""
-    TITLES = {"overall": "Member Statistics", "duel": "Duel Statistics"}
+    """Member stats card. Overall by default; the Duel / Spar buttons switch it (press the active one again to go back).
+    Only the person who asked can use the buttons."""
+    TITLES = {"overall": "Member Statistics", "duel": "Duel Statistics", "spar": "Spar Statistics"}
 
     def __init__(self, asker_id: int, user, current: str = "overall"):
         super().__init__(timeout=300)
@@ -5291,8 +6409,27 @@ class StatsView(discord.ui.LayoutView):
         container = discord.ui.Container(accent_colour=STATS_BLACK)
         container.add_item(discord.ui.Section(head, discord.ui.TextDisplay("\n".join(body)),
                                               accessory=discord.ui.Thumbnail(user.display_avatar.url)))
+        if self.current == "overall":
+            lines = []
+            for mode in LB_MODES:
+                _, mw, ml, _ = stats_for(user.id, mode)
+                lines.append(f"**{MODES[mode]['name']}:** `{mw}`W  `{ml}`L  -  `{win_rate_text(mw, ml)}`")
+            container.add_item(discord.ui.Separator())
+            container.add_item(discord.ui.TextDisplay("\n".join(lines)))
         container.add_item(discord.ui.Separator())
         container.add_item(discord.ui.TextDisplay("-# Rivalz | Global all-time leaderboard"))
+        row = discord.ui.ActionRow()
+        for key in ("duel", "spar"):
+            btn = discord.ui.Button(label=MODES[key]["name"], custom_id=f"stats:{key}", disabled=disabled,
+                                    style=discord.ButtonStyle.primary if key == self.current else discord.ButtonStyle.secondary)
+            btn.callback = self._make(key)
+            row.add_item(btn)
+        if self.current != "overall":   # Duel / Spar view: a clear way back to the main card
+            back = discord.ui.Button(label="Go Back", custom_id="stats:back", disabled=disabled,
+                                     style=discord.ButtonStyle.danger)
+            back.callback = self._back
+            row.add_item(back)
+        container.add_item(row)
         self.add_item(container)
 
     def _make(self, key):
@@ -5323,7 +6460,7 @@ class StatsView(discord.ui.LayoutView):
 member_group = app_commands.Group(name="member", description="Member tools.")
 
 
-@member_group.command(name="stats", description="See the Duel stats of yourself or any member.")
+@member_group.command(name="stats", description="See Overall stats (plus Duel and Spar) of yourself or any member.")
 @app_commands.describe(member="Whose stats to show (default: you)")
 async def member_stats_cmd(interaction: discord.Interaction, member: discord.User = None):
     await interaction.response.defer()
@@ -5408,6 +6545,13 @@ async def set_count(interaction: discord.Interaction, mode: str, user: discord.U
 async def set_count_d(interaction: discord.Interaction, user: discord.User,
                       wins: app_commands.Range[int, 0, 100000] = None, losses: app_commands.Range[int, 0, 100000] = None):
     await set_count(interaction, "duel", user, wins, losses)
+
+
+@count_group.command(name="s", description="Developer only: set a player's SPAR wins / losses on the leaderboard.")
+@app_commands.describe(user="Whose count to set", wins="Total spar wins", losses="Total spar losses")
+async def set_count_s(interaction: discord.Interaction, user: discord.User,
+                      wins: app_commands.Range[int, 0, 100000] = None, losses: app_commands.Range[int, 0, 100000] = None):
+    await set_count(interaction, "spar", user, wins, losses)
 
 
 bot.tree.add_command(set_group)
