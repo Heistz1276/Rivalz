@@ -3703,8 +3703,8 @@ async def sq_start(L, guild):
     for i, team in enumerate(teams):
         lines.append(f"**{SQUAD_TEAMS[i]}:** " + ", ".join(f"<@{p['discord_id']}>" for p in team))
     caps = [f"**Captain A:** <@{captains[0]}>", f"**Captain B:** <@{captains[1]}>"]
-    try:   # the second embed now starts with the VS picture showing both captains' profiles
-        vs_file, vs_name = await squad_vs_file(guild, captains)
+    try:   # the second embed now starts with the VS picture showing every player's profile (captains on top)
+        vs_file, vs_name = await squad_vs_file(guild, [sorted(t, key=lambda p: p['discord_id'] != captains[k]) for k, t in enumerate(teams)])
     except Exception as exc:
         print(f"Could not draw the VS picture: {exc!r}")
         vs_file, vs_name = None, None
@@ -4234,7 +4234,13 @@ async def squad_new_state(user) -> dict:
 
 
 VS_FILE_NAMES = ("vs.jpg", "vs.png", "vs.jpeg")
-VS_SIZE = (900, 300)      # 3:1, sized to sit neatly across the top of the Teams Announced card
+VS_SIZE = (1000, 497)     # same shape as the background, small enough to sit neatly across the Teams Announced card
+# The background (vs.jpg) is 1779 x 884 with a placeholder circle for two players on each side. These are the
+# placeholder centres, in that picture's own pixels: [left team (blue), right team (red)] x [top, bottom].
+VS_NATIVE = (1779, 884)
+VS_SLOTS = (((438, 129), (438, 714)), ((1342, 131), (1342, 717)))
+VS_PLACEHOLDER_R = 118
+VS_RINGS = ((30, 144, 255), (255, 42, 26))     # blue ring for team A, red ring for team B
 
 
 def find_vs_image() -> str:
@@ -4246,54 +4252,88 @@ def find_vs_image() -> str:
     return ""
 
 
-def _vs_circle(data, d: int):
-    """A round avatar with a white ring, or None when there is no picture."""
+def _vs_avatar(data, r: int, ring_rgb, tint):
+    """A round profile picture (radius r) with a coloured ring. A grey disc when there is no picture."""
     from PIL import Image, ImageDraw
-    if not data:
-        return None
-    try:
-        av = Image.open(io.BytesIO(data)).convert("RGBA").resize((d, d), Image.LANCZOS)
-    except Exception:
-        return None
-    ring = 8
+    ring = max(6, r // 13)
+    d = r * 2
+    av = None
+    if data:
+        try:
+            av = Image.open(io.BytesIO(data)).convert("RGBA").resize((d, d), Image.LANCZOS)
+        except Exception:
+            av = None
+    if av is None:
+        av = Image.new("RGBA", (d, d), tint + (255,))
     out = Image.new("RGBA", (d + ring * 2, d + ring * 2), (0, 0, 0, 0))
-    ImageDraw.Draw(out).ellipse((0, 0, d + ring * 2 - 1, d + ring * 2 - 1), fill=(255, 255, 255, 255))
+    ImageDraw.Draw(out).ellipse((0, 0, out.width - 1, out.height - 1), fill=ring_rgb + (255,))
     mask = Image.new("L", (d, d), 0)
     ImageDraw.Draw(mask).ellipse((0, 0, d - 1, d - 1), fill=255)
     out.paste(av, (ring, ring), mask)
     return out
 
 
-def render_vs_card(avatar_a, avatar_b) -> bytes:
-    """The VS picture, cropped to the card's width, with both captains' profile pictures on their side."""
-    from PIL import Image, ImageDraw
-    W, H = VS_SIZE
+def _vs_positions(n: int, side: int, W: int, H: int):
+    """Where the n pictures of one team go: 2 players use the background's own circles; more are laid out in a grid."""
+    if n <= 2:
+        return list(VS_SLOTS[side][:n]) if n == 2 else [((VS_SLOTS[side][0][0]), H // 2)]
+    cols = 1 if n <= 3 else 2
+    rows = math.ceil(n / cols)
+    cx0 = VS_SLOTS[side][0][0]
+    pitch = 200 if cols == 2 else 0
+    out = []
+    for k in range(n):
+        row, col = divmod(k, cols)
+        in_row = cols if (row < rows - 1 or n % cols == 0) else n % cols
+        x = cx0 + (col - (in_row - 1) / 2) * pitch
+        y = H * (row + 0.5) / rows
+        out.append((int(x), int(y)))
+    return out
+
+
+def render_vs_card(teams_avatars) -> bytes:
+    """teams_avatars = [[bytes|None, ...] team A, [...] team B]. Draws every player's profile picture on their
+    side of the VS background (blue = team A, red = team B) and resizes the result to fit the card."""
+    from PIL import Image, ImageDraw, ImageFilter
     path = find_vs_image()
     if path:
-        base = Image.open(path).convert("RGB")
-        h = round(base.width * H / W)                    # keep the full width, crop the height around the VS logo
-        top = max(0, min(base.height - h, (base.height - h) // 2))
-        base = base.crop((0, top, base.width, top + h)) if h <= base.height else base
-        base = base.resize((W, H), Image.LANCZOS)
-    else:                                                # no vs.jpg next to main.py: draw a simple blue | red split
-        base = Image.new("RGB", (W, H), (190, 30, 20))
-        ImageDraw.Draw(base).rectangle((0, 0, W // 2, H), fill=(25, 85, 190))
-        ImageDraw.Draw(base).text((W // 2 - 14, H // 2 - 8), "VS", fill=(255, 255, 255))
-    base = base.convert("RGBA")
-    d = 190
-    for data, cx in ((avatar_a, 175), (avatar_b, W - 175)):
-        pic = _vs_circle(data, d)
-        if pic:
-            base.alpha_composite(pic, (cx - pic.width // 2, H // 2 - pic.height // 2))
+        base = Image.open(path).convert("RGBA")
+        if base.size != VS_NATIVE:
+            base = base.resize(VS_NATIVE, Image.LANCZOS)
+    else:                                                # no vs.jpg next to main.py: a plain blue | red split
+        base = Image.new("RGBA", VS_NATIVE, (190, 30, 20, 255))
+        ImageDraw.Draw(base).rectangle((0, 0, VS_NATIVE[0] // 2, VS_NATIVE[1]), fill=(25, 85, 190, 255))
+    W, H = base.size
+    counts = [len(t) for t in teams_avatars[:2]]
+    if path and any(c != 2 for c in counts):             # not 2 per side: wipe the placeholder circles first
+        for side in (0, 1):
+            for cx, cy in VS_SLOTS[side]:
+                box = (cx - VS_PLACEHOLDER_R - 30, cy - VS_PLACEHOLDER_R - 30, cx + VS_PLACEHOLDER_R + 30, cy + VS_PLACEHOLDER_R + 30)
+                x0, y0 = max(0, box[0]), max(0, box[1])
+                x1, y1 = min(W, box[2]), min(H, box[3])
+                ring_pix = base.crop((x0, y0, x1, y1)).resize((1, 1), Image.BOX).getpixel((0, 0))
+                fill = Image.new("RGBA", (x1 - x0, y1 - y0), ring_pix)
+                m = Image.new("L", fill.size, 0)
+                ImageDraw.Draw(m).ellipse((cx - x0 - VS_PLACEHOLDER_R - 6, cy - y0 - VS_PLACEHOLDER_R - 6,
+                                           cx - x0 + VS_PLACEHOLDER_R + 6, cy - y0 + VS_PLACEHOLDER_R + 6), fill=255)
+                base.paste(fill, (x0, y0), m.filter(ImageFilter.GaussianBlur(10)))
+    for side in (0, 1):
+        pics = list(teams_avatars[side])
+        n = len(pics)
+        r = 108 if n <= 2 else 92 if n <= 3 else max(46, min(78, 330 // max(1, math.ceil(n / 2))))
+        tint = (40, 70, 130) if side == 0 else (120, 30, 30)
+        for (cx, cy), data in zip(_vs_positions(n, side, W, H), pics):
+            pic = _vs_avatar(data, r, VS_RINGS[side], tint)
+            base.alpha_composite(pic, (cx - pic.width // 2, cy - pic.height // 2))
+    base = base.convert("RGB").resize(VS_SIZE, Image.LANCZOS)
     out = io.BytesIO()
-    base.convert("RGB").save(out, "JPEG", quality=92)
+    base.save(out, "JPEG", quality=92)
     return out.getvalue()
 
 
-async def squad_vs_file(guild, captains):
-    """Fetches both captains' avatars and returns (discord.File, filename)."""
-    datas = []
-    for uid in captains[:2]:
+async def squad_vs_file(guild, teams):
+    """Fetches every player's profile picture and returns (discord.File, filename). Captain is first in each team."""
+    async def one(uid):
         mem = guild.get_member(uid) if guild else None
         if mem is None and guild:
             try:
@@ -4301,8 +4341,12 @@ async def squad_vs_file(guild, captains):
             except discord.HTTPException:
                 mem = None
         url = mem.display_avatar.replace(size=256, format="png").url if mem else None
-        datas.append(await download_bytes(url) if url else None)
-    jpg = await asyncio.to_thread(render_vs_card, datas[0], datas[1])
+        return await download_bytes(url) if url else None
+
+    sides = []
+    for team in teams[:2]:
+        sides.append(list(await asyncio.gather(*[one(p["discord_id"]) for p in team])))
+    jpg = await asyncio.to_thread(render_vs_card, sides)
     return discord.File(io.BytesIO(jpg), filename="vs_card.jpg"), "vs_card.jpg"
 
 
