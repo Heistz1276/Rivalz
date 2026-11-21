@@ -4724,7 +4724,26 @@ class Rivalz(commands.Bot):
         self.roblox: RobloxClient = None
         self._ready_once = False
 
+    async def start_health_server(self):
+        """Render (and cron-job.org) need a web page to talk to. Only starts when the host gives a PORT."""
+        port = os.getenv("PORT", "").strip()
+        if not port.isdigit():
+            return
+        from aiohttp import web
+
+        async def alive(request):
+            return web.Response(text="Rivalz is running")
+
+        app = web.Application()
+        app.router.add_get("/", alive)
+        app.router.add_get("/health", alive)
+        self._web = web.AppRunner(app)
+        await self._web.setup()
+        await web.TCPSite(self._web, "0.0.0.0", int(port)).start()
+        print(f"Health page listening on port {port} (/health)")
+
     async def setup_hook(self):
+        await self.start_health_server()   # first, so the host sees the open port right away
         self.session = aiohttp.ClientSession()
         self.roblox = RobloxClient(self.session)
         self.add_dynamic_items(ChallengeButton, TicketButton, ReopenButton, OpenGankButton, LbButton, LbPage, LbSelect, LbJump,
@@ -4736,6 +4755,8 @@ class Rivalz(commands.Bot):
     async def close(self):
         if self.session:
             await self.session.close()
+        if getattr(self, "_web", None):
+            await self._web.cleanup()
         await super().close()
 
     async def on_ready(self):
